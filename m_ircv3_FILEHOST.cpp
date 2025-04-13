@@ -1,7 +1,7 @@
 /*
  * InspIRCd -- Internet Relay Chat Daemon
  *
- * Copyright (C) 2025-03-12 revrsefr
+ * Copyright (C) 2025-04-12 reverse
  *
  * This file is part of InspIRCd.  InspIRCd is free software: you can
  * redistribute it and/or modify it under the terms of the GNU General Public
@@ -17,412 +17,484 @@
  */
 
 
- #include "inspircd.h"
- #include "modules/httpd.h"
- #include "modules/isupport.h"
- #include "modules/ssl.h"
- #include "fileutils.h"
- #include <map>
- 
- class FilehostUploadHandler : public HTTPRequestEventListener
- {
-  private:
-     Module* mod;
-     std::string uploadpath;
-     std::string baseuri;
-     std::map<std::string, std::string> accepted_mimetypes;
-     bool authenticate;
- 
-  public:
-     FilehostUploadHandler(Module* m, const std::string& uploaddir, const std::string& uri, bool auth)
-         : HTTPRequestEventListener(m)
-         , mod(m)
-         , uploadpath(uploaddir)
-         , baseuri(uri)
-         , authenticate(auth)
-     {
-         // Create the upload directory if it doesn't exist
-         if (!FileSystem::Exists(uploadpath))
-         {
-             FileSystem::CreateDirectory(uploadpath);
-         }
-         
-         // Initialize accepted MIME types
-         accepted_mimetypes["text/plain"] = "txt";
-         accepted_mimetypes["text/html"] = "html";
-         accepted_mimetypes["image/png"] = "png";
-         accepted_mimetypes["image/jpeg"] = "jpg";
-         accepted_mimetypes["image/gif"] = "gif";
-         accepted_mimetypes["application/pdf"] = "pdf";
-     }
- 
-     ModResult OnHTTPRequest(HTTPRequest& request) override
-     {
-         // Only handle requests to our specific endpoint and only POST for uploads
-         if (request.GetPath() != baseuri)
-             return MOD_RES_PASSTHRU;
- 
-         if (request.GetType() == "OPTIONS")
-         {
-             // Handle OPTIONS request for CORS and to indicate accepted MIME types
-             HTTPHeaders headers;
-             headers.SetHeader("Allow", "OPTIONS, POST");
-             headers.SetHeader("Access-Control-Allow-Origin", "*");
-             headers.SetHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-             headers.SetHeader("Access-Control-Allow-Headers", "Content-Type, Content-Disposition, Content-Length, Authorization");
-             
-             // Construct Accept-Post header with all valid MIME types
-             std::string accept_post;
-             for (const auto& [mimetype, ext] : accepted_mimetypes)
-             {
-                 if (!accept_post.empty())
-                     accept_post += ", ";
-                 accept_post += mimetype;
-             }
-             headers.SetHeader("Accept-Post", accept_post);
- 
-             // Send response
-             std::stringstream response;
-             request.sock->Page(&response, 200, &headers);
-             return MOD_RES_DENY;
-         }
-         
-         if (request.GetType() != "POST")
-         {
-             // Only POST method is allowed for file uploads
-             HTTPHeaders headers;
-             headers.SetHeader("Allow", "OPTIONS, POST");
-             std::stringstream response;
-             response << "<h1>405 Method Not Allowed</h1>";
-             response << "<p>Only POST requests are allowed for file uploads</p>";
-             request.sock->Page(&response, 405, &headers);
-             return MOD_RES_DENY;
-         }
-         
-         // Handle authentication if required
-         if (authenticate)
-         {
-             // Get Authorization header
-             std::string auth_header = request.headers->GetHeader("Authorization");
-             if (auth_header.empty())
-             {
-                 // Authorization required
-                 HTTPHeaders headers;
-                 headers.SetHeader("WWW-Authenticate", "Basic realm=\"InspIRCd FileHost\"");
-                 std::stringstream response;
-                 response << "<h1>401 Unauthorized</h1>";
-                 response << "<p>Authentication is required to upload files</p>";
-                 request.sock->Page(&response, 401, &headers);
-                 return MOD_RES_DENY;
-             }
-             
-             // Simple auth check - in a real implementation we will check
-             // against the same credentials used on the IRC connection
-         
-         // Get content type and check if it's accepted
-         std::string content_type = request.headers->GetHeader("Content-Type");
-         std::string file_ext = "bin";
-         bool valid_type = false;
-         
-         // Check if the content type is in our list of accepted types
-         auto it = accepted_mimetypes.find(content_type);
-         if (it != accepted_mimetypes.end())
-         {
-             file_ext = it->second;
-             valid_type = true;
-         }
-         
-         // If not an accepted type, reject the upload
-         if (!valid_type)
-         {
-             std::stringstream response;
-             response << "<h1>415 Unsupported Media Type</h1>";
-             response << "<p>The provided content type is not supported</p>";
-             request.sock->Page(&response, 415, request.headers);
-             return MOD_RES_DENY;
-         }
-         
-         // Get Content-Disposition header for the filename
-         std::string filename;
-         std::string content_disp = request.headers->GetHeader("Content-Disposition");
-         
-         if (!content_disp.empty())
-         {
-             // Extract filename from Content-Disposition
-             size_t filename_pos = content_disp.find("filename=\"");
-             if (filename_pos != std::string::npos)
-             {
-                 filename_pos += 10; // Length of 'filename="'
-                 size_t end_pos = content_disp.find("\"", filename_pos);
-                 if (end_pos != std::string::npos)
-                 {
-                     filename = content_disp.substr(filename_pos, end_pos - filename_pos);
-                 }
-             }
-         }
-         
-         // Generate a random filename if none was provided
-         if (filename.empty())
-         {
-             std::string random_str = ServerInstance->GenRandomStr(16);
-             filename = random_str + "." + file_ext;
-         }
-         else
-         {
-             // Sanitize the filename to prevent directory traversal
-             size_t slash_pos;
-             while ((slash_pos = filename.find('/')) != std::string::npos)
-                 filename[slash_pos] = '_';
-             while ((slash_pos = filename.find('\\')) != std::string::npos)
-                 filename[slash_pos] = '_';
-         }
-         
-         // Ensure the file has the correct extension
-         if (!filename.empty() && filename.find('.') == std::string::npos)
-         {
-             filename += "." + file_ext;
-         }
-         
-         // Form the full path
-         std::string fullpath = uploadpath + "/" + filename;
-         
-         // Write the file
-         try
-         {
-             FileWriter fw(fullpath);
-             fw.WriteString(request.GetPostData());
-         }
-         catch (const CoreException& ex)
-         {
-             ServerInstance->Logs.Log(MODNAME, LOG_DEFAULT, "Error writing uploaded file %s: %s", 
-                 fullpath.c_str(), ex.GetReason().c_str());
-             std::stringstream response;
-             response << "<h1>500 Internal Server Error</h1>";
-             response << "<p>Failed to write uploaded file: " << ex.GetReason() << "</p>";
-             request.sock->Page(&response, 500, request.headers);
-             return MOD_RES_DENY;
-         }
-         
-         // Form the public URL of the uploaded file
-         std::string server_hostname = ServerInstance->Config->ServerName;
-         std::string public_url = baseuri + "/" + filename;
-         if (baseuri.back() == '/')
-             public_url = baseuri + filename;
-         
-         // Send the response with the URL to the uploaded file
-         HTTPHeaders headers;
-         headers.SetHeader("Location", public_url);
-         headers.SetHeader("Content-Type", "text/plain");
-         
-         std::stringstream response;
-         response << public_url;
-         
-         request.sock->Page(&response, 201, &headers);
-         return MOD_RES_DENY;
-     }
- };
- 
- class FilehostGetHandler : public HTTPRequestEventListener
- {
-  private:
-     Module* mod;
-     std::string uploadpath;
-     std::string baseuri;
- 
-  public:
-     FilehostGetHandler(Module* m, const std::string& uploaddir, const std::string& uri)
-         : HTTPRequestEventListener(m)
-         , mod(m)
-         , uploadpath(uploaddir)
-         , baseuri(uri)
-     {
-     }
- 
-     ModResult OnHTTPRequest(HTTPRequest& request) override
-     {
-         // Should start with the base URI but not equal to it (we want a file)
-         if (request.GetPath() == baseuri || !insp::starts_with(request.GetPath(), baseuri))
-             return MOD_RES_PASSTHRU;
- 
-         if (request.GetType() != "GET" && request.GetType() != "HEAD")
-             return MOD_RES_PASSTHRU;
- 
-         // Extract the filename from the path
-         std::string filepath = request.GetPath().substr(baseuri.length());
-         
-         // Remove leading slashes
-         while (!filepath.empty() && filepath[0] == '/')
-             filepath = filepath.substr(1);
-         
-         // Prevent directory traversal
-         size_t slash_pos;
-         while ((slash_pos = filepath.find('/')) != std::string::npos)
-             filepath[slash_pos] = '_';
-         while ((slash_pos = filepath.find('\\')) != std::string::npos)
-             filepath[slash_pos] = '_';
-         
-         // Form the full path
-         std::string fullpath = uploadpath + "/" + filepath;
- 
-         // Check if the file exists
-         if (!FileSystem::Exists(fullpath) || FileSystem::GetFileSize(fullpath) == -1)
-         {
-             std::stringstream response;
-             response << "<h1>404 Not Found</h1>";
-             response << "<p>The requested file was not found</p>";
-             request.sock->Page(&response, 404, request.headers);
-             return MOD_RES_DENY;
-         }
- 
-         // Get MIME type based on file extension
-         std::string mime_type = "application/octet-stream";
-         size_t dot_pos = filepath.find_last_of('.');
-         if (dot_pos != std::string::npos)
-         {
-             std::string ext = filepath.substr(dot_pos + 1);
-             
-             // Basic MIME type mapping based on extension
-             if (ext == "txt")
-                 mime_type = "text/plain";
-             else if (ext == "html" || ext == "htm")
-                 mime_type = "text/html";
-             else if (ext == "png")
-                 mime_type = "image/png";
-             else if (ext == "jpg" || ext == "jpeg")
-                 mime_type = "image/jpeg";
-             else if (ext == "gif")
-                 mime_type = "image/gif";
-             else if (ext == "pdf")
-                 mime_type = "application/pdf";
-         }
- 
-         // Set up headers
-         HTTPHeaders headers;
-         headers.SetHeader("Content-Type", mime_type);
-         
-         // If it's a HEAD request, just respond with headers
-         if (request.GetType() == "HEAD")
-         {
-             std::stringstream empty_response;
-             request.sock->Page(&empty_response, 200, &headers);
-             return MOD_RES_DENY;
-         }
- 
-         // Read and serve the file content
-         try
-         {
-             FileReader fr(fullpath);
-             std::stringstream response;
-             response << fr.GetString();
-             request.sock->Page(&response, 200, &headers);
-         }
-         catch (const CoreException& ex)
-         {
-             ServerInstance->Logs.Log(MODNAME, LOG_DEFAULT, "Error reading file %s: %s", 
-                 fullpath.c_str(), ex.GetReason().c_str());
-             std::stringstream response;
-             response << "<h1>500 Internal Server Error</h1>";
-             response << "<p>Failed to read file: " << ex.GetReason() << "</p>";
-             request.sock->Page(&response, 500, request.headers);
-         }
-         
-         return MOD_RES_DENY;
-     }
- };
- 
- class ModuleFileHost : public Module, public ISupport::EventListener
- {
-  private:
-     std::string uploadpath;
-     std::string baseuri;
-     std::string public_url;
-     
-     bool authenticate;
-     bool require_ssl;
-     
-     HTTPdAPI API;
-     FilehostUploadHandler* uploadhandler = nullptr;
-     FilehostGetHandler* gethandler = nullptr;
- 
-  public:
-     ModuleFileHost()
-         : Module(VF_VENDOR, "Provides a file hosting service for users to upload and share files on IRC")
-         , ISupport::EventListener(this)
-         , API(this)
-     {
-     }
- 
-     ~ModuleFileHost()
-     {
-         delete uploadhandler;
-         delete gethandler;
-     }
- 
-     void ReadConfig(ConfigStatus& status) override
-     {
-         const auto& tag = ServerInstance->Config->ConfValue("filehost");
-         
-         uploadpath = tag->getString("uploadpath", "data/uploads");
-         baseuri = tag->getString("uri", "/upload");
-         authenticate = tag->getBool("authenticate", true);
-         require_ssl = tag->getBool("requiressl", true);
-         
-         // Ensure the base URI begins with a slash
-         if (baseuri.empty() || baseuri[0] != '/')
-             baseuri = "/" + baseuri;
-         
-         // Construct the full public URL
-         std::string hostname = ServerInstance->Config->ServerName;
-         int port = tag->getInt("port", 0);
-         bool use_ssl = tag->getBool("ssl", true);
-         
-         // Determine protocol and port
-         std::string protocol = use_ssl ? "https" : "http";
-         
-         // Construct the URL
-         public_url = protocol + "://" + hostname;
-         if (port > 0)
-             public_url += ":" + std::to_string(port);
-         public_url += baseuri;
-         
-         // Unregister old handlers if they exist
-         if (uploadhandler)
-         {
-             delete uploadhandler;
-             uploadhandler = nullptr;
-         }
-         
-         if (gethandler)
-         {
-             delete gethandler;
-             gethandler = nullptr;
-         }
-         
-         // Create new handlers
-         uploadhandler = new FilehostUploadHandler(this, uploadpath, baseuri, authenticate);
-         gethandler = new FilehostGetHandler(this, uploadpath, baseuri);
-     }
- 
-     void OnBuildISupport(ISupport::TokenMap& tokens) override
-     {
-         tokens["FILEHOST"] = public_url;
-     }
- 
-     ModResult OnUserPreMessage(User* user, const MessageTarget& target, MessageDetails& details) override
-     {
-         // If we require SSL, check if users are trying to use FILEHOST over a non-SSL connection
-         if (require_ssl)
-         {
-             LocalUser* localuser = IS_LOCAL(user);
-             if (localuser && !localuser->eh.GetIOHook() && details.text.find(public_url) != std::string::npos)
-             {
-                 // User is trying to send a FILEHOST URL over a non-SSL connection
-                 user->WriteNotice("You cannot send FILEHOST URLs over a non-SSL connection. Please use an SSL connection.");
-                 return MOD_RES_DENY;
-             }
-         }
-         return MOD_RES_PASSTHRU;
-     }
- };
- 
- MODULE_INIT(ModuleFileHost)
+/// $ModAuthor: reverse <mike.chevronnet@gmail.com>
+/// $ModDepends: core 4
+/// $ModDesc: Provides the DRAFT FILEHOST IRCv3 extension.
+
+
+/// $LinkerFlags: -lcrypto -lssl
+
+
+#include "inspircd.h"
+#include "modules/cap.h"
+#include "modules/ctctags.h"
+#include "modules/isupport.h"
+#include "modules/ssl.h"
+#include "modules/account.h"
+#include "modules/ircv3.h"
+#include "clientprotocolmsg.h"
+#include <jwt-cpp/jwt.h>
+
+
+// File type enumeration for metadata
+enum FileType
+{
+    FILE_UNKNOWN,
+    FILE_IMAGE,
+    FILE_TEXT,
+    FILE_BINARY,
+    FILE_ARCHIVE,
+    FILE_DOCUMENT
+};
+
+// JWT wrapper class using jwt-cpp library
+class JWT
+{
+ public:
+    static std::string Generate(const std::string& username, const std::string& secret, const std::string& issuer, time_t expiry)
+    {
+        // Simplified token generation using the provided issuer
+        auto token = jwt::create()
+            .set_issuer(issuer)
+            .set_subject(username)
+            .set_issued_at(std::chrono::system_clock::from_time_t(ServerInstance->Time()))
+            .set_expires_at(std::chrono::system_clock::from_time_t(expiry))
+            .sign(jwt::algorithm::hs256{secret});
+
+        return token;
+    }
+
+    static bool Verify(const std::string& token, const std::string& secret, const std::string& issuer)
+    {
+        try
+        {
+            // Verify the token with the provided secret and issuer
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{secret})
+                .with_issuer(issuer);
+
+            auto decoded = jwt::decode(token);
+            verifier.verify(decoded);
+
+            return true;
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+    
+    static std::string GetUsername(const std::string& token)
+    {
+        try
+        {
+            auto decoded = jwt::decode(token);
+            return decoded.get_subject();
+        }
+        catch (const std::exception&)
+        {
+            return "";
+        }
+    }
+    
+    static std::string GetIssuer(const std::string& token)
+    {
+        try
+        {
+            auto decoded = jwt::decode(token);
+            return decoded.get_issuer();
+        }
+        catch (const std::exception&)
+        {
+            return "";
+        }
+    }
+};
+
+// Filehost message tag provider
+class FileHostTag final : public ClientProtocol::MessageTagProvider
+{
+ private:
+    Cap::Capability& cap;
+
+ public:
+    FileHostTag(Module* Creator, Cap::Capability& Cap)
+        : ClientProtocol::MessageTagProvider(Creator)
+        , cap(Cap)
+    {
+    }
+
+    ModResult OnProcessTag(User* user, const std::string& tagname, std::string& tagvalue) override
+    {
+        if (tagname != "reverse.im/filehost")
+            return MOD_RES_PASSTHRU;
+
+        // Only allow servers to set this tag
+        if (IS_LOCAL(user))
+            return MOD_RES_DENY;
+
+        return MOD_RES_ALLOW;
+    }
+
+    bool ShouldSendTag(LocalUser* user, const ClientProtocol::MessageTagData& tagdata) override
+    {
+        return cap.IsEnabled(user);
+    }
+};
+
+class CommandFilehost : public SplitCommand
+{
+ private:
+    std::string& public_url;
+    std::string& jwt_secret;
+    std::string& jwt_issuer;
+    unsigned int token_expiry;
+    
+ public:
+    std::string filehost_auth_msg;  // Made public so it can be accessed by the Module class
+    
+    CommandFilehost(Module* parent, std::string& url, std::string& secret, std::string& issuer, unsigned int expiry)
+        : SplitCommand(parent, "FILEHOST", 0)
+        , public_url(url)
+        , jwt_secret(secret)
+        , jwt_issuer(issuer)
+        , token_expiry(expiry)
+    {
+        syntax.push_back("[info]");
+        penalty = 2;  // Small penalty to prevent abuse
+        filehost_auth_msg = ServerInstance->Config->ConfValue("filehost")->getString("auth_message", "Use /msg NickServ IDENTIFY password to log in.");
+    }
+
+    CmdResult HandleLocal(LocalUser* user, const Params& parameters) override
+    {
+        // Check if the user is identified with services (account)
+        const std::string* accountname = nullptr;
+        
+        Account::API accountapi(this->creator);
+        if (accountapi && *accountapi)
+        {
+            accountname = (*accountapi)->GetAccountName(user);
+        }
+
+        if (!accountname || accountname->empty())
+        {
+            user->WriteNotice("*** You must be logged in to use file hosting. " + filehost_auth_msg);
+            return CmdResult::FAILURE;
+        }
+
+        // Simplified token generation using the existing JWT::Generate method
+        time_t expiry = ServerInstance->Time() + token_expiry;
+        std::string token = JWT::Generate(user->nick, jwt_secret, jwt_issuer, expiry);
+        std::string auth_url = public_url + "/upload?token=" + token;
+
+        // User is authorized, send file upload instructions with JWT token
+        if (parameters.empty())
+        {
+            user->WriteNotice("*** FILEHOST: Upload files using " + auth_url);
+            user->WriteNotice("*** FILEHOST: You're already authenticated through IRC! No need to log in again.");
+            user->WriteNotice("*** FILEHOST: Share files with others using " + public_url + "/files/filename");
+            user->WriteNotice("*** FILEHOST: Your logged in account: " + *accountname);
+            user->WriteNotice("*** FILEHOST: Your upload link is valid for " + ConvToStr(token_expiry / 60) + " minutes");
+            return CmdResult::SUCCESS;
+        }
+        else if (parameters[0] == "info")
+        {
+            user->WriteNotice("*** FILEHOST: Service provided by " + public_url);
+            user->WriteNotice("*** FILEHOST: Maximum file size: 16MB");
+            user->WriteNotice("*** FILEHOST: Allowed file types: txt, pdf, png, jpg, jpeg, gif, html, htm, css, js, svg");
+            return CmdResult::SUCCESS;
+        }
+
+        user->WriteNotice("*** FILEHOST: Unknown parameter. Use /FILEHOST without parameters for help.");
+        return CmdResult::SUCCESS;
+    }
+};
+
+class ModuleFileHost : public Module, public ISupport::EventListener, public Cap::Capability, public CTCTags::EventListener
+{
+ private:
+    std::string public_url;
+    bool require_ssl;
+    std::string jwt_secret;
+    std::string jwt_issuer;
+    unsigned int token_expiry;
+    CommandFilehost cmd;
+    FileHostTag filetag;
+    Events::ModuleEventProvider tagevprov;
+    CTCTags::CapReference ctctagcap;
+    
+    // Helper to determine file type from extension
+    FileType GetFileTypeFromExtension(const std::string& filename) const
+    {
+        std::string ext;
+        size_t dot_pos = filename.rfind('.');
+        
+        if (dot_pos != std::string::npos)
+            ext = filename.substr(dot_pos + 1);
+            
+        if (ext.empty())
+            return FILE_UNKNOWN;
+            
+        // Convert to lowercase for comparison
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        
+        // Image formats
+        if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif" || ext == "svg")
+            return FILE_IMAGE;
+            
+        // Text formats
+        if (ext == "txt" || ext == "html" || ext == "htm" || ext == "css" || ext == "js")
+            return FILE_TEXT;
+            
+        // Document formats
+        if (ext == "pdf" || ext == "doc" || ext == "docx")
+            return FILE_DOCUMENT;
+            
+        // Archive formats
+        if (ext == "zip" || ext == "tar" || ext == "gz" || ext == "rar")
+            return FILE_ARCHIVE;
+            
+        return FILE_BINARY;
+    }
+    
+    // Extract filename from URL
+    std::string GetFilenameFromURL(const std::string& url) const
+    {
+        // Check if it's our filehost URL
+        if (url.find(public_url + "/files/") != 0)
+            return "";
+            
+        // Extract the filename part
+        std::string filename = url.substr((public_url + "/files/").length());
+        
+        // Remove any query parameters
+        size_t qmark = filename.find('?');
+        if (qmark != std::string::npos)
+            filename = filename.substr(0, qmark);
+            
+        return filename;
+    }
+    
+    // Create metadata for file
+    void AddFileMetadataTags(ClientProtocol::TagMap& tags, const std::string& url)
+    {
+        std::string filename = GetFilenameFromURL(url);
+        if (filename.empty())
+            return;
+            
+        FileType type = GetFileTypeFromExtension(filename);
+        
+        // Create JSON metadata structure
+        std::string metadata = "{\"url\":\"" + url + "\",\"filename\":\"" + filename + "\"";
+        
+        // Add file type
+        switch (type)
+        {
+            case FILE_IMAGE:
+                metadata += ",\"type\":\"image\"";
+                break;
+            case FILE_TEXT:
+                metadata += ",\"type\":\"text\"";
+                break;
+            case FILE_DOCUMENT:
+                metadata += ",\"type\":\"document\"";
+                break;
+            case FILE_ARCHIVE:
+                metadata += ",\"type\":\"archive\"";
+                break;
+            case FILE_BINARY:
+                metadata += ",\"type\":\"binary\"";
+                break;
+            default:
+                metadata += ",\"type\":\"unknown\"";
+        }
+        
+        metadata += "}";
+        
+        // Add tag to tagmap
+        tags.emplace("reverse.im/filehost", ClientProtocol::MessageTagData(&filetag, metadata));
+    }
+
+    void SendTagMsg(User* user, const std::string& url, const std::string& metadata)
+    {
+        // Create a tag map to hold the metadata
+        ClientProtocol::TagMap tags;
+        AddFileMetadataTags(tags, url);
+
+        // Corrected to use CTCTags::TagMessage directly.
+        CTCTags::TagMessage tagmsg(user, "*", tags);
+        // Wrap the CTCTags::TagMessage in a ClientProtocol::Event and send it.
+        ClientProtocol::Event tagEvent(ServerInstance->GetRFCEvents().privmsg, tagmsg);
+        for (const auto& [_, current_user] : ServerInstance->Users.GetUsers()) {
+            LocalUser* localuser = IS_LOCAL(current_user);
+            if (localuser && ctctagcap.IsEnabled(localuser)) {
+                localuser->Send(tagEvent);
+            }
+        }
+    }
+
+ public:
+    ModuleFileHost()
+        : Module(VF_VENDOR, "Provides information about the external file hosting service for users to upload and share files on IRC")
+        , ISupport::EventListener(this)
+        , Cap::Capability(this, "reverse.im/filehost")
+        , CTCTags::EventListener(this)
+        , cmd(this, public_url, jwt_secret, jwt_issuer, token_expiry)
+        , filetag(this, *this)
+        , tagevprov(this, "event/filehost")
+        , ctctagcap(this)
+    {
+    }
+
+    void ReadConfig(ConfigStatus& status) override
+    {
+        const auto& tag = ServerInstance->Config->ConfValue("filehost");
+        
+        require_ssl = tag->getBool("requiressl", true);
+        
+        // Get the public URL from configuration
+        public_url = tag->getString("website", "https://filehost.example.com");
+        
+        // Ensure the URL doesn't end with a trailing slash
+        if (!public_url.empty() && public_url.back() == '/')
+            public_url.pop_back();
+            
+        // Get the JWT secret from configuration
+        jwt_secret = tag->getString("jwt_secret", "defaultsecret");
+        
+        // Get the JWT issuer from configuration
+        jwt_issuer = tag->getString("jwt_issuer", "FILEHOST");
+        
+        // Get the token expiry time from configuration (default to 1 hour)
+        token_expiry = tag->getNum<unsigned int>("token_expiry", 3600, 60, 86400);
+        
+        // Update command authentication message if config changes
+        std::string new_auth_msg = tag->getString("auth_message", "Use /msg NickServ IDENTIFY password to log in.");
+        cmd.filehost_auth_msg = new_auth_msg;
+    }
+
+    void OnBuildISupport(ISupport::TokenMap& tokens) override
+    {
+        tokens["reverse.im/FILEHOST"] = public_url;
+    }
+
+    ModResult OnUserPreMessage(User* user, MessageTarget& target, MessageDetails& details) override
+    {
+        // If we require SSL, check if users are trying to use FILEHOST over a non-SSL connection
+        if (require_ssl)
+        {
+            LocalUser* localuser = IS_LOCAL(user);
+            if (localuser && !localuser->eh.GetIOHook() && 
+                (details.text.find(public_url) != std::string::npos))
+            {
+                // User is trying to send a FILEHOST URL over a non-SSL connection
+                user->WriteNotice("You cannot send FILEHOST URLs over a non-SSL connection. Please use an SSL connection.");
+                return MOD_RES_DENY;
+            }
+        }
+        
+        // Simple check for filehost URLs
+        bool has_url = false;
+        std::string url;
+        size_t start_pos = std::string::npos;
+        
+        // Check for both your configured domain and hardcoded domain
+        if (details.text.find(public_url + "/files/") != std::string::npos) 
+        {
+            start_pos = details.text.find(public_url + "/files/");
+            has_url = true;
+        }
+    
+        if (has_url)
+        {
+            // Extract the complete URL
+            size_t end_pos = details.text.find_first_of(" \r\n", start_pos);
+            if (end_pos == std::string::npos)
+                end_pos = details.text.length();
+                
+            url = details.text.substr(start_pos, end_pos - start_pos);
+            
+            // Simple clean up of URL (remove trailing punctuation)
+            const std::string punctuation = ",.;:!?'\"()[]{}";
+            while (!url.empty() && punctuation.find(url.back()) != std::string::npos)
+            {
+                url.pop_back();
+            }
+            
+            // Extract filename from URL
+            std::string filename;
+            if (url.find(public_url + "/files/") != std::string::npos)
+            {
+                filename = url.substr((public_url + "/files/").length());
+            }
+  
+            // Create JSON metadata with file info
+            std::string metadata = "{\"url\":\"" + url + "\"";
+            
+            // Add filename if available
+            if (!filename.empty())
+            {
+                metadata += ",\"filename\":\"" + filename + "\"";
+                
+                // Try to determine file type based on extension
+                std::string ext;
+                size_t dot_pos = filename.rfind('.');
+                if (dot_pos != std::string::npos)
+                {
+                    ext = filename.substr(dot_pos + 1);
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                    
+                    // Add file type if we can determine it
+                    if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif" || ext == "svg")
+                    {
+                        metadata += ",\"type\":\"image\"";
+                    }
+                    else if (ext == "txt" || ext == "md" || ext == "html" || ext == "htm")
+                    {
+                        metadata += ",\"type\":\"text\"";
+                    }
+                    else if (ext == "pdf" || ext == "doc" || ext == "docx")
+                    {
+                        metadata += ",\"type\":\"document\"";
+                    }
+                }
+            }
+            
+            // Close the JSON object
+            metadata += "}";
+            
+            // Add tag directly to message using emplace instead of operator[]
+            details.tags_out.emplace("reverse.im/filehost", ClientProtocol::MessageTagData(&filetag, metadata));
+            
+            // Send TAGMSG to the user
+            SendTagMsg(user, url, metadata);
+            
+            ServerInstance->Logs.Debug(MODNAME, "Added tag to message with URL: {}", url);
+        }
+        
+        return MOD_RES_PASSTHRU;
+    }
+    
+    void OnUserPostNick(User* user, const std::string& oldnick) override
+    {
+        // If the user is identified and changes their nick, remind them about filehost
+        const std::string* accountname = nullptr;
+        
+        Account::API accountapi(this);
+        if (accountapi && *accountapi)
+        {
+            accountname = (*accountapi)->GetAccountName(user);
+            if (accountname && !accountname->empty())
+            {
+                user->WriteNotice("*** Remember: You can use /FILEHOST to get upload info for sharing files");
+            }
+        }
+    }
+
+    const std::string* GetValue(LocalUser* user) const override
+    {
+        return &public_url;
+    }
+};
+
+MODULE_INIT(ModuleFileHost)
