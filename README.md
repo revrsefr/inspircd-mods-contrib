@@ -3,4 +3,4 @@
 ### USE AT YOUR OWN RISK, SOME MODULES MAYBE STILL WORK IN PROGRESS ###
 Where to find me?<br>
 IRC Server: irc.chaat.site +6697 (tls)
-Channel: #devel
+Channel: #dev
