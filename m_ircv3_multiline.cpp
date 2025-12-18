@@ -199,6 +199,8 @@ private:
 	ClientProtocol::EventProvider batchevprov;
 	SimpleExtItem<UserBatches> userbatches;
 	uint64_t nextbatchid = 0;
+	ChanModeReference moderatedmode;
+	ChanModeReference noextmsgmode;
 
 	static bool IsChannelTarget(const std::string& target)
 	{
@@ -240,6 +242,21 @@ private:
 		return bytes;
 	}
 
+	bool CanSendToChannel(LocalUser* user, Channel* chan)
+	{
+		if (chan->IsModeSet(noextmsgmode) && !chan->HasUser(user))
+			return false;
+
+		bool no_chan_priv = chan->GetPrefixValue(user) < VOICE_VALUE;
+		if (no_chan_priv && chan->IsModeSet(moderatedmode))
+			return false;
+
+		if (no_chan_priv && ServerInstance->Config->RestrictBannedUsers != ServerConfig::BUT_NORMAL && chan->IsBanned(user))
+			return false;
+
+		return true;
+	}
+
 	void DeliverBatch(User* source, const MultilineBatch& batch)
 	{
 		// Target can be a channel or a user.
@@ -257,17 +274,19 @@ private:
 		std::vector<LocalUser*> multiline_users;
 		std::vector<LocalUser*> fallback_users;
 
+		const auto IsMultilineRecipient = [this](LocalUser* lu)
+		{
+			return lu->IsFullyConnected() && cap.IsEnabled(lu) && batchcap.IsEnabled(lu) && messagetagcap.IsEnabled(lu);
+		};
+
 		if (chan)
 		{
 			for (const auto& [u, memb] : chan->GetUsers())
 			{
 				LocalUser* lu = IS_LOCAL(u);
-				if (!lu)
+				if (!lu || lu == source || !lu->IsFullyConnected())
 					continue;
-				if (source == lu)
-					continue;
-
-				if (cap.IsEnabled(lu))
+				if (IsMultilineRecipient(lu))
 					multiline_users.push_back(lu);
 				else
 					fallback_users.push_back(lu);
@@ -276,9 +295,9 @@ private:
 		else
 		{
 			LocalUser* lu = IS_LOCAL(usertarget);
-			if (lu && lu != source)
+			if (lu && lu != source && lu->IsFullyConnected())
 			{
-				if (cap.IsEnabled(lu))
+				if (IsMultilineRecipient(lu))
 					multiline_users.push_back(lu);
 				else
 					fallback_users.push_back(lu);
@@ -320,18 +339,54 @@ private:
 			lu->Send(endevent);
 		}
 
-		// Send fallback to non-supporting local users.
-		for (auto* lu : fallback_users)
+		// Send fallback. For channels, use normal channel routing (remote servers get fallback too),
+		// excluding local multiline-capable recipients to avoid duplicate delivery.
+		if (chan)
 		{
+			CUList exemptions;
+			exemptions.insert(source);
+			for (auto* lu : multiline_users)
+				exemptions.insert(lu);
+
 			for (const auto& line : batch.lines)
 			{
 				if (line.text.empty())
 					continue; // MUST NOT send blank lines in fallback.
 
-				ClientProtocol::Messages::Privmsg msg(ClientProtocol::Messages::Privmsg::nocopy, source, batch.target, line.text, msgtype);
+				ClientProtocol::Messages::Privmsg msg(ClientProtocol::Messages::Privmsg::nocopy, source, chan, line.text, msgtype);
+				msg.SetSideEffect(true);
+				chan->Write(ServerInstance->GetRFCEvents().privmsg, msg, 0, exemptions);
+			}
+		}
+		else
+		{
+			// Local fallback delivery.
+			for (auto* lu : fallback_users)
+			{
+				for (const auto& line : batch.lines)
+				{
+					if (line.text.empty())
+						continue; // MUST NOT send blank lines in fallback.
 
-				ClientProtocol::Event ev(ServerInstance->GetRFCEvents().privmsg, msg);
-				lu->Send(ev);
+					ClientProtocol::Messages::Privmsg msg(ClientProtocol::Messages::Privmsg::nocopy, source, batch.target, line.text, msgtype);
+					ClientProtocol::Event ev(ServerInstance->GetRFCEvents().privmsg, msg);
+					lu->Send(ev);
+				}
+			}
+
+			// Remote fallback delivery.
+			if (usertarget && !IS_LOCAL(usertarget))
+			{
+				for (const auto& line : batch.lines)
+				{
+					if (line.text.empty())
+						continue;
+
+					std::vector<std::string> p{ batch.target, line.text };
+					ClientProtocol::TagMap t;
+					CommandBase::Params params(p, t);
+					ServerInstance->Parser.CallHandler(cmdstr, params, source);
+				}
 			}
 		}
 	}
@@ -532,6 +587,24 @@ private:
 					return CmdResult::FAILURE;
 				}
 
+				// Validate sendability for channel targets (we may contain blank lines which the core PRIVMSG handler would reject).
+				if (IsChannelTarget(it->second.target))
+				{
+					Channel* chan = ServerInstance->Channels.Find(it->second.target);
+					if (!chan)
+					{
+						parent.SendFail(lu, this, "MULTILINE_INVALID", "Invalid multiline target");
+						batches.open.erase(it);
+						return CmdResult::FAILURE;
+					}
+					if (!parent.CanSendToChannel(lu, chan))
+					{
+						parent.SendFail(lu, this, "MULTILINE_INVALID", "Invalid multiline batch");
+						batches.open.erase(it);
+						return CmdResult::FAILURE;
+					}
+				}
+
 				parent.DeliverBatch(lu, it->second);
 				batches.open.erase(it);
 				return CmdResult::SUCCESS;
@@ -554,6 +627,8 @@ public:
 		, fail(this)
 		, batchevprov(this, "BATCH")
 		, userbatches(this, "ircv3-multiline-batches", ExtensionType::USER)
+		, moderatedmode(this, "moderated")
+		, noextmsgmode(this, "noextmsg")
 		, cmdbatch(this, *this)
 	{
 	}
