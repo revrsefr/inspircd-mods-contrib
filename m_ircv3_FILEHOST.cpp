@@ -148,12 +148,12 @@ class CommandFilehost : public SplitCommand
     std::string& public_url;
     std::string& jwt_secret;
     std::string& jwt_issuer;
-    unsigned int token_expiry;
+    unsigned int& token_expiry;
     
  public:
     std::string filehost_auth_msg;  // Made public so it can be accessed by the Module class
     
-    CommandFilehost(Module* parent, std::string& url, std::string& secret, std::string& issuer, unsigned int expiry)
+    CommandFilehost(Module* parent, std::string& url, std::string& secret, std::string& issuer, unsigned int& expiry)
         : SplitCommand(parent, "FILEHOST", 0)
         , public_url(url)
         , jwt_secret(secret)
@@ -339,6 +339,7 @@ class ModuleFileHost : public Module, public ISupport::EventListener, public Cap
         , ISupport::EventListener(this)
         , Cap::Capability(this, "reverse.im/filehost")
         , CTCTags::EventListener(this)
+        , token_expiry(3600)
         , cmd(this, public_url, jwt_secret, jwt_issuer, token_expiry)
         , filetag(this, *this)
         , tagevprov(this, "event/filehost")
