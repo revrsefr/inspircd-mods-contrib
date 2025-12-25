@@ -1,193 +1,175 @@
 /*
  * InspIRCd -- Internet Relay Chat Daemon
  *
- *   Copyright (C) 2025 reverse Chevronnet
- *   mike.chevronnet@gmail.com
+ *   Copyright (C) 2024 Jean reverse Chevronnet <mike.chevronnet@gmail.com>
  *
- * This file is part of InspIRCd. InspIRCd is free software; you can
- * redistribute it and/or modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation; version 2. MERMEWÑNDLHBDJSKAO HHDSALKYHDASLKYHVA
+ * This program is distributed under the terms of the GNU General Public
+ * License as published by the Free Software Foundation, version 2.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 /// $ModAuthor: reverse Chevronnet <mike.chevronnet@gmail.com>
-/// $ModDesc: Handles Google reCAPTCHA v2 verification via SQL and NickServ accounts.
-/// $ModConfig: url="https://recaptcha.vicio.chat/verify/" 
-///             dbid="default" query="SELECT COUNT(*) FROM recaptcha_app_verificationtoken WHERE token = $1 AND created_at + INTERVAL '30 minutes' > NOW()"
-///             whitelistchans="#help,#opers" whitelistports="6667,6697">
+/// $ModDesc: Google reCAPTCHA v2 verification via JWT with HTTP backend check.
+/// $ModConfig: <captchaconfig url="https://chaat.site/recaptcha/verify/"
+///             checkurl="https://chaat.site/recaptcha/check_token/"
+///             secret="your_jwt_secret"
+///             issuer="https://chaat.site"
+///             whitelistchans="#help,#opers"
+///             whitelistports="6697,7000"
+///             message="*** reCAPTCHA: Verify your connection at {url}">
 /// $ModDepends: core 4
 
-/// $LinkerFlags: -lcrypto
+/// $LinkerFlags: -lcrypto -lcurl
+
 
 #include "inspircd.h"
-#include "modules/sql.h"
+#include "modules/account.h"
 #include "extension.h"
-#include <openssl/sha.h> // For SHA256
-#include "modules/account.h"  // Add Account API
+#include <jwt-cpp/jwt.h>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
-class ModuleCaptchaCheck; // Forward declaration
+using json = nlohmann::json;
 
-// Command for /VERIFY <token>
-class CommandVerificar final : public Command
+class ModuleCaptchaJwt;
+
+class CommandVerify final : public Command
 {
-private:
-    ModuleCaptchaCheck* parent;
+    ModuleCaptchaJwt* parent;
 
 public:
-    CommandVerificar(Module* Creator, ModuleCaptchaCheck* Parent)
+    CommandVerify(Module* Creator, ModuleCaptchaJwt* Parent)
         : Command(Creator, "VERIFY", 1, 1), parent(Parent)
     {
-        syntax = { "<verification_token>" };
+        syntax = { "<jwt_token>" };
     }
 
     CmdResult Handle(User* user, const Params& parameters) override;
 };
 
-// SQL Query for token validation
-class ValidateTokenQuery final : public SQL::Query
+class ModuleCaptchaJwt final : public Module
 {
 private:
-    User* user;
-    BoolExtItem& captcha_verified;
-
-public:
-    ValidateTokenQuery(Module* Creator, User* User, BoolExtItem& CaptchaVerified)
-        : SQL::Query(Creator), user(User), captcha_verified(CaptchaVerified) {}
-
-    void OnResult(SQL::Result& result) override
-    {
-        SQL::Row row;
-        if (result.GetRow(row))
-        {
-            const std::string count = row[0].value_or("0");
-            if (count == "1")
-            {
-                captcha_verified.Set(user, true);
-                user->WriteNotice("*** reCAPTCHA: Verification successful. You may now join channels.");
-            }
-            else
-            {
-                user->WriteNotice("*** reCAPTCHA: Verification failed. Token not found or expired.");
-            }
-        }
-        else
-        {
-            user->WriteNotice("*** reCAPTCHA: Verification failed. Token not found.");
-        }
-    }
-
-    void OnError(const SQL::Error& error) override
-    {
-        user->WriteNotice(INSP_FORMAT("*** reCAPTCHA: SQL Error: {}", error.ToString()));
-    }
-};
-
-class ModuleCaptchaCheck final : public Module
-{
-private:
-    std::string captcha_url;
-    std::string query;
-    dynamic_reference<SQL::Provider> sql;
+    std::string jwt_secret, jwt_issuer, captcha_url, check_url, verify_message;
     BoolExtItem captcha_verified;
-    CommandVerificar cmdverificar;
+    CommandVerify cmdverify;
     Account::API accountapi;
 
 public:
-    ModuleCaptchaCheck()
-        : Module(VF_VENDOR, "Handles Google reCAPTCHA v2 verification via SQL and NickServ."),
-          sql(this, "SQL"),
+    ModuleCaptchaJwt()
+        : Module(VF_VENDOR, "reCAPTCHA JWT verification via CURL endpoint."),
           captcha_verified(this, "captcha-verified", ExtensionType::USER, true),
-          cmdverificar(this, this),
+          cmdverify(this, this),
           accountapi(this) {}
 
     void ReadConfig(ConfigStatus& status) override
     {
         auto& tag = ServerInstance->Config->ConfValue("captchaconfig");
-
-        // Read reCAPTCHA URL and SQL query
+        jwt_secret = tag->getString("secret");
+        jwt_issuer = tag->getString("issuer");
         captcha_url = tag->getString("url");
-        query = tag->getString("query", "SELECT COUNT(*) FROM recaptcha_app_verificationtoken WHERE token = $1 AND created_at + INTERVAL '30 minutes' > NOW()", 1);
+        check_url = tag->getString("checkurl");
+        verify_message = tag->getString("message", "*** reCAPTCHA: Verify your connection at {url}");
 
-        // Setup SQL provider
-        std::string dbid = tag->getString("dbid", "default");
-        sql.SetProvider("SQL/" + dbid);
-
-        if (!sql)
-        {
-            throw ModuleException(this, INSP_FORMAT("*** reCAPTCHA: Could not find SQL provider with id '{}'.", dbid));
-        }
+        if (jwt_secret.empty() || captcha_url.empty() || check_url.empty())
+            throw ModuleException(this, "You must configure 'secret', 'url', and 'checkurl'.");
     }
 
     ModResult OnUserPreJoin(LocalUser* user, Channel* chan, const std::string& cname, std::string& privs, const std::string& keygiven, bool override) override
     {
-        if (user->IsOper())
+        if (user->IsOper() || captcha_verified.Get(user) || (accountapi && accountapi->GetAccountName(user)))
             return MOD_RES_PASSTHRU;
 
-        // Check if the user is identified to NickServ
-    if (accountapi && accountapi->GetAccountName(user))
-    {
-        user->WriteNotice("*** reCAPTCHA: NickServ account verified. You may join channels.");
-        return MOD_RES_PASSTHRU;
-    }
-
         auto& tag = ServerInstance->Config->ConfValue("captchaconfig");
-        std::set<std::string> whitelist_channels;
-        std::stringstream chanstream(tag->getString("whitelistchans"));
-        std::string channel_name;
-        while (std::getline(chanstream, channel_name, ','))
-            whitelist_channels.insert(channel_name);
 
-        if (whitelist_channels.find(cname) != whitelist_channels.end())
+        std::set<std::string> whitelist_chans;
+        irc::commasepstream chanstream(tag->getString("whitelistchans"));
+        std::string whitelisted;
+        while (chanstream.GetToken(whitelisted))
+            whitelist_chans.insert(whitelisted);
+
+        if (whitelist_chans.count(cname))
             return MOD_RES_PASSTHRU;
 
         std::set<int> whitelist_ports;
-        std::stringstream portstream(tag->getString("whitelistports"));
-        std::string port_str;
-        while (std::getline(portstream, port_str, ','))
-            whitelist_ports.insert(std::stoi(port_str));
+        irc::commasepstream portstream(tag->getString("whitelistports"));
+        std::string port;
+        while (portstream.GetToken(port))
+            whitelist_ports.insert(std::stoi(port));
 
-        if (whitelist_ports.find(user->server_sa.port()) != whitelist_ports.end())
-            return MOD_RES_PASSTHRU;
-
-        if (captcha_verified.Get(user))
+        if (whitelist_ports.count(user->server_sa.port()))
             return MOD_RES_PASSTHRU;
 
         NotifyUserToVerify(user);
         return MOD_RES_DENY;
     }
 
-    void ValidateToken(User* user, const std::string& token)
+    bool CheckTokenWithDjango(const std::string& jwt_token)
     {
-        if (!sql)
-        {
-            user->WriteNotice("*** reCAPTCHA: SQL database is not available.");
-            return;
+        CURL* curl = curl_easy_init();
+        if (!curl)
+            return false;
+
+        std::string url = check_url + "?token=" + jwt_token;
+        std::string response_data;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, true); // false for testing this must be true in production
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void* ptr, size_t size, size_t nmemb, std::string* data) {
+            data->append((char*)ptr, size * nmemb);
+            return size * nmemb;
+        });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK)
+            return false;
+
+        try {
+            auto json_response = json::parse(response_data);
+            return json_response.value("verified", false);
+        } catch (...) {
+            return false;
         }
-
-        // Replace $1 placeholder with the actual token value
-        std::string formatted_query = INSP_FORMAT(
-            "SELECT COUNT(*) FROM recaptcha_app_verificationtoken WHERE token = '{}' AND created_at + INTERVAL '30 minutes' > NOW()",
-            token);
-
-        sql->Submit(new ValidateTokenQuery(this, user, captcha_verified), formatted_query);
     }
 
-private:
+    void VerifyJWT(User* user, const std::string& token)
+    {
+        try
+        {
+            auto decoded = jwt::decode(token);
+            jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{jwt_secret})
+                .with_issuer(jwt_issuer)
+                .verify(decoded);
+
+            if (!CheckTokenWithDjango(token))
+            {
+                user->WriteNotice("*** reCAPTCHA: You must complete verification at the provided link first.");
+                return;
+            }
+
+            captcha_verified.Set(user, true);
+            user->WriteNotice("*** reCAPTCHA: Verification successful. You may now join channels.");
+        }
+        catch (const std::exception& ex)
+        {
+            user->WriteNotice(INSP_FORMAT("*** reCAPTCHA: Invalid JWT token ({})", ex.what()));
+        }
+    }
+
     void NotifyUserToVerify(User* user)
     {
-        auto& tag = ServerInstance->Config->ConfValue("captchaconfig");
+        std::string token = GenerateJWT(user);
+        std::string link = captcha_url + "?token=" + token;
 
-        // Generate token
-        std::string token = GenerateToken();
-        std::string hash = GenerateHash(token);
-
-        // Debug logs
-        ServerInstance->Logs.Debug(MODNAME, "Generated token: {}", token);
-        ServerInstance->Logs.Debug(MODNAME, "Generated hash: {}", hash);
-
-        // Build verification message
-        std::string message = tag->getString("message", "*** reCAPTCHA: Verify your connection at {url}.");
-        std::string link = captcha_url + "?code=" + token + "&hn=" + hash;
-
+        std::string message = verify_message;
         size_t pos = message.find("{url}");
         if (pos != std::string::npos)
             message.replace(pos, 5, link);
@@ -195,38 +177,21 @@ private:
         user->WriteNotice(message);
     }
 
-    std::string GenerateToken()
+    std::string GenerateJWT(User* user)
     {
-        static const char hex_chars[] = "0123456789abcdef";
-        std::string token;
-
-        for (int i = 0; i < 64; ++i)
-            token += hex_chars[std::rand() % 16];
-
-        return token;
-    }
-
-    std::string GenerateHash(const std::string& token)
-    {
-        unsigned char hash[SHA256_DIGEST_LENGTH];
-        SHA256(reinterpret_cast<const unsigned char*>(token.c_str()), token.size(), hash);
-
-        std::string hash_string;
-        for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i)
-        {
-            hash_string += "0123456789abcdef"[hash[i] >> 4];
-            hash_string += "0123456789abcdef"[hash[i] & 0xf];
-        }
-
-        return hash_string;
+        return jwt::create()
+            .set_issuer(jwt_issuer)
+            .set_subject(user->uuid)
+            .set_issued_at(std::chrono::system_clock::now())
+            .set_expires_at(std::chrono::system_clock::now() + std::chrono::minutes{30})
+            .sign(jwt::algorithm::hs256{jwt_secret});
     }
 };
 
-CmdResult CommandVerificar::Handle(User* user, const Params& parameters)
+CmdResult CommandVerify::Handle(User* user, const Params& parameters)
 {
-    const std::string& token = parameters[0];
-    parent->ValidateToken(user, token);
+    parent->VerifyJWT(user, parameters[0]);
     return CmdResult::SUCCESS;
 }
 
-MODULE_INIT(ModuleCaptchaCheck)
+MODULE_INIT(ModuleCaptchaJwt)
