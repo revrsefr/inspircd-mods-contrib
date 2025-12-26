@@ -15,6 +15,8 @@
 /// $ModAuthor: reverse Chevronnet <mike.chevronnet@gmail.com>
 /// $ModDesc: Google reCAPTCHA v2 verification via JWT with HTTP backend check.
 /// $ModConfig: <captchaconfig url="https://chaat.site/recaptcha/verify/"
+///             url4="https://v4.chaat.site/recaptcha/verify/"
+///             url6="https://v6.chaat.site/recaptcha/verify/"
 ///             checkurl="https://chaat.site/recaptcha/check_token/"
 ///             secret="your_jwt_secret"
 ///             issuer="https://chaat.site"
@@ -54,7 +56,7 @@ public:
 class ModuleCaptchaJwt final : public Module
 {
 private:
-    std::string jwt_secret, jwt_issuer, captcha_url, check_url, verify_message;
+    std::string jwt_secret, jwt_issuer, captcha_url, captcha_url4, captcha_url6, check_url, verify_message;
     BoolExtItem captcha_verified;
     CommandVerify cmdverify;
     Account::API accountapi;
@@ -72,6 +74,8 @@ public:
         jwt_secret = tag->getString("secret");
         jwt_issuer = tag->getString("issuer");
         captcha_url = tag->getString("url");
+        captcha_url4 = tag->getString("url4", captcha_url);
+        captcha_url6 = tag->getString("url6", captcha_url);
         check_url = tag->getString("checkurl");
         verify_message = tag->getString("message", "*** reCAPTCHA: Verify your connection at {url}");
 
@@ -147,7 +151,26 @@ public:
             jwt::verify()
                 .allow_algorithm(jwt::algorithm::hs256{jwt_secret})
                 .with_issuer(jwt_issuer)
+                .with_subject(user->uuid)
                 .verify(decoded);
+
+            std::string token_ip;
+            try
+            {
+                token_ip = decoded.get_payload_claim("ip").as_string();
+            }
+            catch (...)
+            {
+                user->WriteNotice("*** reCAPTCHA: Token missing IP binding. Please reconnect and verify again.");
+                return;
+            }
+
+            const std::string current_ip = user->client_sa.addr();
+            if (token_ip != current_ip)
+            {
+                user->WriteNotice("*** reCAPTCHA: Token IP mismatch. Please reconnect and verify again.");
+                return;
+            }
 
             if (!CheckTokenWithDjango(token))
             {
@@ -167,7 +190,13 @@ public:
     void NotifyUserToVerify(User* user)
     {
         std::string token = GenerateJWT(user);
-        std::string link = captcha_url + "?token=" + token;
+        const std::string* baseurl = &captcha_url;
+        if (user->client_sa.family() == AF_INET)
+            baseurl = &captcha_url4;
+        else if (user->client_sa.family() == AF_INET6)
+            baseurl = &captcha_url6;
+
+        std::string link = *baseurl + "?token=" + token;
 
         std::string message = verify_message;
         size_t pos = message.find("{url}");
@@ -182,6 +211,7 @@ public:
         return jwt::create()
             .set_issuer(jwt_issuer)
             .set_subject(user->uuid)
+            .set_payload_claim("ip", jwt::claim(user->client_sa.addr()))
             .set_issued_at(std::chrono::system_clock::now())
             .set_expires_at(std::chrono::system_clock::now() + std::chrono::minutes{30})
             .sign(jwt::algorithm::hs256{jwt_secret});
