@@ -1,7 +1,7 @@
 /*
  * InspIRCd -- Internet Relay Chat Daemon
  *
- *   (C) 2026 YourName
+ *   (C) 2026 reverse - mike.chevronnet@gmail.com
  *
  * Implements UnrealIRCd 6-style security-groups for InspIRCd 4.
  *
@@ -25,7 +25,7 @@
  * - /SECURITYGROUPS [nick] command
  */
 
-/// $ModAuthor: YourName
+/// $ModAuthor: reverse - mike.chevronnet@gmail.com
 /// $ModDepends: core 4
 /// $ModDesc: Implements UnrealIRCd-style security-groups for InspIRCd 4.
 /// $ModConfig: <securitygroup name="example" mask="*@example.com" account="no" tls="no" insecure="no" websocket="no" webirc="no" public="yes">
