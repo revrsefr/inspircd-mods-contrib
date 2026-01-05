@@ -10,6 +10,8 @@
  *   <securitygroup name="webirc-users"
  *     mask="*@webirc.example.com"
  *     webirc="yes"
+ *     scoremin="0"
+ *     scoremax="100"
  *     public="yes">
  *
  * Supported matching options:
@@ -51,6 +53,8 @@ struct SecurityGroup final
 	bool require_insecure = false;
 	bool require_websocket = false;
 	bool require_webirc = false;
+	int score_min = -1;
+	int score_max = -1;
 	bool publicgroup = false;
 };
 
@@ -132,6 +136,7 @@ private:
 	};
 
 	std::vector<SecurityGroup> groups;
+	IntExtItem* repouserext = nullptr;
 
 	Account::API accountapi;
 	BoolExtItem webircext;
@@ -228,6 +233,19 @@ private:
 				return false;
 		}
 
+		if (group.score_min != -1 || group.score_max != -1)
+		{
+			if (!repouserext)
+				return false;
+
+			const intptr_t raw = repouserext->Get(user);
+			const int score = static_cast<int>(std::max<intptr_t>(0, raw));
+			if (group.score_min != -1 && score < group.score_min)
+				return false;
+			if (group.score_max != -1 && score > group.score_max)
+				return false;
+		}
+
 		return true;
 	}
 
@@ -275,6 +293,12 @@ public:
 	void ReadConfig(ConfigStatus& status) override
 	{
 		std::vector<SecurityGroup> newgroups;
+		repouserext = nullptr;
+		if (auto* extitem = ServerInstance->Extensions.GetItem("reputation"))
+		{
+			if (extitem->extype == ExtensionType::USER)
+				repouserext = static_cast<IntExtItem*>(extitem);
+		}
 
 		for (const auto& [_, tag] : ServerInstance->Config->ConfTags("securitygroup"))
 		{
@@ -294,6 +318,12 @@ public:
 			group.require_insecure = tag->getBool("insecure", tag->getBool("insecure-users", false));
 			group.require_websocket = tag->getBool("websocket", tag->getBool("websocket-users", false));
 			group.require_webirc = tag->getBool("webirc", tag->getBool("webirc-users", false));
+			group.score_min = tag->getNum<int>("scoremin", -1);
+			group.score_max = tag->getNum<int>("scoremax", -1);
+			if ((group.score_min != -1 && group.score_min < 0) || (group.score_max != -1 && group.score_max < 0))
+				throw ModuleException(this, "<securitygroup> scoremin/scoremax must be >= 0 (or omitted) at " + tag->source.str());
+			if (group.score_min != -1 && group.score_max != -1 && group.score_min > group.score_max)
+				throw ModuleException(this, "<securitygroup> scoremin must be <= scoremax at " + tag->source.str());
 
 			if (group.require_tls && group.require_insecure)
 				throw ModuleException(this, "<securitygroup> can not have both tls and insecure enabled at " + tag->source.str());
