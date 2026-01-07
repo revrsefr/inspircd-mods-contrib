@@ -319,15 +319,18 @@ private:
 			auto& entry = GetOrCreateEntry(ip);
 			const bool loggedin = accountapi && accountapi->GetAccountName(user);
 
+			bool scorechanged = false;
 			if (entry.marker != marker_unreg && entry.marker != marker_reg)
 			{
 				entry.marker = marker_unreg;
 				if (entry.score < scorecap)
 				{
 					entry.score++;
+					scorechanged = true;
 					if (loggedin && entry.score < scorecap)
 					{
 						entry.score++;
+						scorechanged = true;
 						entry.marker = marker_reg;
 					}
 					MarkUpsert(ip);
@@ -336,6 +339,7 @@ private:
 			else if (entry.marker == marker_unreg && loggedin && entry.score < scorecap)
 			{
 				entry.score++;
+				scorechanged = true;
 				entry.marker = marker_reg;
 				MarkUpsert(ip);
 			}
@@ -345,6 +349,10 @@ private:
 			if (entry.last_seen != oldlast)
 				MarkUpsert(ip);
 			repouserext.Set(user, entry.score, false);
+
+			// Keep remote servers in sync so opers/extbans see the same reputation.
+			if (scorechanged)
+				BroadcastScore(ip, ConvToStr(entry.score), ServerInstance->FakeClient);
 		}
 	}
 
@@ -663,6 +671,23 @@ public:
 
 		LoadFlatfileDatabase();
 
+		// On module load/reload we might already have local users. Ensure their
+		// current reputation is synced to the network.
+		for (auto* user : ServerInstance->Users.GetLocalUsers())
+		{
+			if (!user || user->quitting)
+				continue;
+			UpdateUser(user);
+
+			const std::string& ip = GetUserAddress(user);
+			if (ip.empty())
+				continue;
+
+			const auto score = static_cast<unsigned long>(std::max<intptr_t>(0, repouserext.Get(user)));
+			if (score)
+				BroadcastScore(ip, ConvToStr(score), ServerInstance->FakeClient);
+		}
+
 		// Add timers.
 		bumptimer.SetInterval(bumpinterval);
 		expiretimer.SetInterval(expireinterval);
@@ -762,7 +787,10 @@ CommandReputation::CommandReputation(Module* Creator, ModuleReputation& Parent)
 	: Command(Creator, "REPUTATION", 0, 2)
 	, parent(Parent)
 {
-	access_needed = CmdAccess::OPERATOR;
+	// Must be callable via ENCAP by remote servers (which won't have oper access
+	// in the command parser). We enforce oper-only access for local users in
+	// Handle() instead.
+	access_needed = CmdAccess::NORMAL;
 	syntax = { "[<nick|ip|#channel|<N>] [<value>]" };
 }
 
@@ -783,6 +811,12 @@ CmdResult CommandReputation::Handle(User* user, const Params& parameters)
 	LocalUser* localuser = IS_LOCAL(user);
 	if (!localuser)
 		return CmdResult::SUCCESS;
+
+	if (!localuser->IsOper())
+	{
+		localuser->WriteNumeric(ERR_NOPRIVILEGES, "Permission Denied - You do not have the required operator privileges");
+		return CmdResult::FAILURE;
+	}
 
 	if (parameters.empty())
 	{
