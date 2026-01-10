@@ -588,6 +588,7 @@ private:
 		user->WriteNotice("/REPUTATION <ip> <value>    Set reputation score of IP");
 		user->WriteNotice("/REPUTATION <channel>       List users in channel along with their reputation score");
 		user->WriteNotice("/REPUTATION <NN             List users with reputation score below NN");
+		user->WriteNotice("/REPUTATION >NN             List users with reputation score above NN");
 	}
 
 	void ShowRecord(User* user, const std::string& ip)
@@ -679,6 +680,28 @@ private:
 
 			const auto score = static_cast<unsigned long>(std::max<intptr_t>(0, repouserext.Get(target)));
 			if (score >= maxscore)
+				continue;
+
+			user->WriteNotice(INSP_FORMAT("{}!{}@{} [{}] (score: {})",
+				target->nick,
+				target->GetUser(false),
+				target->GetRealHost(),
+				target->GetAddress(),
+				score));
+		}
+		user->WriteNotice("End of list.");
+	}
+
+	void ListQueryAbove(User* user, unsigned long minscore)
+	{
+		user->WriteNotice(INSP_FORMAT("Users and reputation scores >{}:", minscore));
+		for (const auto& [_, target] : ServerInstance->Users.GetUsers())
+		{
+			if (!target || IS_SERVER(target) || target->server->IsService())
+				continue;
+
+			const auto score = static_cast<unsigned long>(std::max<intptr_t>(0, repouserext.Get(target)));
+			if (score <= minscore)
 				continue;
 
 			user->WriteNotice(INSP_FORMAT("{}!{}@{} [{}] (score: {})",
@@ -853,7 +876,7 @@ CommandReputation::CommandReputation(Module* Creator, ModuleReputation& Parent)
 	// in the command parser). We enforce oper-only access for local users in
 	// Handle() instead.
 	access_needed = CmdAccess::NORMAL;
-	syntax = { "[<nick|ip|#channel|<N>] [<value>]" };
+	syntax = { "[<nick|ip|#channel|<N|>N>] [<value>]" };
 }
 
 RouteDescriptor CommandReputation::GetRouting(User* user, const Params& parameters)
@@ -910,6 +933,18 @@ CmdResult CommandReputation::Handle(User* user, const Params& parameters)
 			return CmdResult::FAILURE;
 		}
 		parent.ListQuery(localuser, max);
+		return CmdResult::SUCCESS;
+	}
+
+	if (!target.empty() && target[0] == '>')
+	{
+		unsigned long min = ConvToNum<unsigned long>(target.substr(1));
+		if (min < 1)
+		{
+			localuser->WriteNotice("REPUTATION: Invalid search value. Use e.g. /REPUTATION >1");
+			return CmdResult::FAILURE;
+		}
+		parent.ListQueryAbove(localuser, min);
 		return CmdResult::SUCCESS;
 	}
 
