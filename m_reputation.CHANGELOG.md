@@ -17,6 +17,8 @@ The dates use the server/local development timeline.
 - New config options on the main `<reputation>` tag:
   - `ipv6prefix` (0–128)
   - `ipv4prefix` (0–32)
+- `/REPUTATION >N` to list users whose score is strictly greater than `N`.
+- Extended ban `score:>N` (and `y:>N`) to match users whose score is strictly greater than `N`.
 
 ### Fixed
 
