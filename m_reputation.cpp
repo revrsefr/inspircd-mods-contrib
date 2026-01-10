@@ -25,7 +25,7 @@
  * Exposes:
  * - user extension "reputation" (per-user score, synced to local users)
  * - /REPUTATION command (operator-only)
- * - extended ban "score" e.g. +b score:<100 (ban users with score < 100)
+ * - extended ban "score" e.g. +b score:<100 (ban users with score < 100), +b score:>100 (ban users with score > 100)
  */
 
 /// $ModAuthor: reverse - mike.chevronnet@gmail.com
@@ -112,6 +112,7 @@ public:
 	void Canonicalize(std::string& text) override
 	{
 		// Allow score:<100 as a more readable form.
+		// Note: we do not strip '>' because it changes the meaning.
 		if (!text.empty() && text.front() == '<')
 			text.erase(text.begin());
 	}
@@ -119,7 +120,10 @@ public:
 	bool IsMatch(User* user, Channel* channel, const std::string& text) override
 	{
 		std::string parsed = text;
-		if (!parsed.empty() && parsed.front() == '<')
+
+		// Default to the legacy behavior (treat as score:<N).
+		const bool gt = (!parsed.empty() && parsed.front() == '>');
+		if (!parsed.empty() && (parsed.front() == '<' || parsed.front() == '>'))
 			parsed.erase(parsed.begin());
 
 		unsigned long threshold = 0;
@@ -127,7 +131,7 @@ public:
 			return false;
 
 		const auto score = static_cast<unsigned long>(std::max<intptr_t>(0, repouserext.Get(user)));
-		return score < threshold;
+		return gt ? (score > threshold) : (score < threshold);
 	}
 };
 
