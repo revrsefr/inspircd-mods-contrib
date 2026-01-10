@@ -13,6 +13,8 @@
  *
  *   <reputation
  *     database="reputation.db"
+ *     ipv4prefix="32"
+ *     ipv6prefix="64"
  *     bumpinterval="5m"
  *     expireinterval="605"
  *     saveinterval="902"
@@ -29,7 +31,7 @@
 /// $ModAuthor: reverse - mike.chevronnet@gmail.com
 /// $ModDepends: core 4
 /// $ModDesc: Tracks IP reputation and provides a score-based extban.
-/// $ModConfig: <reputation database="reputation.db" bumpinterval="5m" expireinterval="605" saveinterval="902" minchanmembers="3" scorecap="10000" whois="all">
+/// $ModConfig: <reputation database="reputation.db" ipv4prefix="32" ipv6prefix="64" bumpinterval="5m" expireinterval="605" saveinterval="902" minchanmembers="3" scorecap="10000" whois="all">
 
 
 #include "inspircd.h"
@@ -190,6 +192,8 @@ private:
 	unsigned long saveinterval = DEFAULT_SAVE_INTERVAL;
 	unsigned long minchanmembers = 3;
 	uint16_t scorecap = DEFAULT_SCORE_CAP;
+	unsigned char ipv4prefix = 32;
+	unsigned char ipv6prefix = 64;
 	WhoisVisibility whoisvis = WhoisVisibility::ALL;
 
 	ReputationTimer bumptimer;
@@ -219,9 +223,36 @@ private:
 		return maxcount;
 	}
 
-	const std::string& GetUserAddress(User* user) const
+	std::string NormaliseReputationKey(const irc::sockets::sockaddrs& sa) const
 	{
-		return user->GetAddress();
+		if (!sa.is_ip())
+			return "";
+
+		const unsigned char maxlen = sa.family() == AF_INET ? 32 : 128;
+		unsigned char prefix = sa.family() == AF_INET ? ipv4prefix : ipv6prefix;
+		if (prefix > maxlen)
+			prefix = maxlen;
+		return irc::sockets::cidr_mask(sa, prefix).str();
+	}
+
+	std::string NormaliseReputationKey(const std::string& address) const
+	{
+		// Accept plain IPs as well as CIDR strings.
+		std::string ip = address;
+		const auto slashpos = ip.find('/');
+		if (slashpos != std::string::npos)
+			ip.erase(slashpos);
+
+		irc::sockets::sockaddrs sa;
+		if (!sa.from_ip(ip))
+			return "";
+
+		return NormaliseReputationKey(sa);
+	}
+
+	std::string GetReputationKey(User* user) const
+	{
+		return NormaliseReputationKey(user->client_sa);
 	}
 
 	ReputationEntry* FindEntry(const std::string& ip)
@@ -265,14 +296,14 @@ private:
 			if (!user)
 				continue;
 
-			if (user->GetAddress() == ip)
+			if (GetReputationKey(user) == ip)
 				repouserext.Set(user, score, false);
 		}
 	}
 
 	void UpdateUser(User* user)
 	{
-		const std::string& ip = GetUserAddress(user);
+		const std::string ip = GetReputationKey(user);
 		const auto* entry = FindEntry(ip);
 		repouserext.Set(user, entry ? entry->score : 0, false);
 	}
@@ -306,7 +337,7 @@ private:
 			if (!user || user->quitting)
 				continue;
 
-			const std::string& ip = GetUserAddress(user);
+			const std::string ip = GetReputationKey(user);
 			if (ip.empty())
 				continue;
 
@@ -384,7 +415,7 @@ private:
 		std::ifstream stream(dbpath);
 		if (!stream.is_open())
 		{
-			ServerInstance->Logs.Critical(MODNAME, "Cannot read database '{}'! {} ({})", dbpath, strerror(errno), errno);
+			ServerInstance->Logs.Critical("m_reputation", "Cannot read database '{}'! {} ({})", dbpath, strerror(errno), errno);
 			return false;
 		}
 
@@ -413,7 +444,7 @@ private:
 		}
 		else
 		{
-			ServerInstance->Logs.Warning(MODNAME, "Ignoring reputation database '{}' due to unknown header.", dbpath);
+			ServerInstance->Logs.Warning("m_reputation", "Ignoring reputation database '{}' due to unknown header.", dbpath);
 			return true;
 		}
 
@@ -429,10 +460,15 @@ private:
 			if (ip.empty() || score.empty() || lastseen.empty())
 				continue;
 
+			// Migrate legacy per-IP entries to the currently configured key format.
+			const std::string key = NormaliseReputationKey(ip);
+			if (key.empty())
+				continue;
+
 			ReputationEntry entry;
 			entry.score = std::min<uint16_t>(static_cast<uint16_t>(ConvToNum<unsigned long>(score)), scorecap);
 			entry.last_seen = ConvToNum<time_t>(lastseen);
-			MergeEntry(ip, entry);
+			MergeEntry(key, entry);
 		}
 
 		return true;
@@ -444,7 +480,7 @@ private:
 		std::ofstream stream(tmpdbpath);
 		if (!stream.is_open())
 		{
-			ServerInstance->Logs.Critical(MODNAME, "Cannot create database '{}'! {} ({})", tmpdbpath, strerror(errno), errno);
+			ServerInstance->Logs.Critical("m_reputation", "Cannot create database '{}'! {} ({})", tmpdbpath, strerror(errno), errno);
 			return false;
 		}
 
@@ -459,7 +495,7 @@ private:
 
 		if (stream.fail())
 		{
-			ServerInstance->Logs.Critical(MODNAME, "Cannot write database '{}'! {} ({})", tmpdbpath, strerror(errno), errno);
+			ServerInstance->Logs.Critical("m_reputation", "Cannot write database '{}'! {} ({})", tmpdbpath, strerror(errno), errno);
 			return false;
 		}
 		stream.close();
@@ -469,7 +505,7 @@ private:
 #endif
 		if (::rename(tmpdbpath.c_str(), dbpath.c_str()) < 0)
 		{
-			ServerInstance->Logs.Critical(MODNAME, "Cannot replace old database '{}' with new database '{}'! {} ({})", dbpath, tmpdbpath, strerror(errno), errno);
+			ServerInstance->Logs.Critical("m_reputation", "Cannot replace old database '{}' with new database '{}'! {} ({})", dbpath, tmpdbpath, strerror(errno), errno);
 			return false;
 		}
 
@@ -501,6 +537,10 @@ private:
 
 	void HandleRemoteUpdate(const std::string& ip, const std::string& scoretext)
 	{
+		const std::string key = NormaliseReputationKey(ip);
+		if (key.empty())
+			return;
+
 		bool forced = false;
 		std::string text = scoretext;
 		if (!text.empty() && text.front() == '*')
@@ -519,13 +559,13 @@ private:
 		if (!score && !forced)
 			return;
 
-		auto& entry = GetOrCreateEntry(ip);
+		auto& entry = GetOrCreateEntry(key);
 		if (forced || score > entry.score)
 		{
 			entry.score = score;
 			entry.last_seen = ServerInstance->Time();
-			MarkUpsert(ip);
-			UpdateUsersForIP(ip, score);
+			MarkUpsert(key);
+			UpdateUsersForIP(key, score);
 		}
 	}
 
@@ -552,16 +592,23 @@ private:
 
 	void ShowRecord(User* user, const std::string& ip)
 	{
-		auto* entry = FindEntry(ip);
+		const std::string key = NormaliseReputationKey(ip);
+		if (key.empty())
+		{
+			user->WriteNotice(INSP_FORMAT("Invalid IP address '{}'", ip));
+			return;
+		}
+
+		auto* entry = FindEntry(key);
 		if (!entry)
 		{
-			user->WriteNotice(INSP_FORMAT("No reputation record found for IP {}", ip));
+			user->WriteNotice(INSP_FORMAT("No reputation record found for {}", key));
 			return;
 		}
 
 		const time_t now = ServerInstance->Time();
 		user->WriteNotice("****************************************************");
-		user->WriteNotice(INSP_FORMAT("Reputation record for IP {}:", ip));
+		user->WriteNotice(INSP_FORMAT("Reputation record for {}:", key));
 		user->WriteNotice(INSP_FORMAT("    Score: {}", entry->score));
 		user->WriteNotice(INSP_FORMAT("Last seen: {} ago (unixtime: {})", Duration::ToLongString(static_cast<unsigned long>(now - entry->last_seen)), entry->last_seen));
 		user->WriteNotice("****************************************************");
@@ -569,15 +616,22 @@ private:
 
 	void SetScore(User* user, const std::string& ip, unsigned long value)
 	{
+		const std::string key = NormaliseReputationKey(ip);
+		if (key.empty())
+		{
+			user->WriteNotice(INSP_FORMAT("Invalid IP address '{}'", ip));
+			return;
+		}
+
 		const uint16_t score = std::min<uint16_t>(static_cast<uint16_t>(value), scorecap);
-		auto& entry = GetOrCreateEntry(ip);
+		auto& entry = GetOrCreateEntry(key);
 		entry.score = score;
 		entry.last_seen = ServerInstance->Time();
-		MarkUpsert(ip);
-		UpdateUsersForIP(ip, score);
+		MarkUpsert(key);
+		UpdateUsersForIP(key, score);
 
-		BroadcastScore(ip, INSP_FORMAT("*{}*", score), ServerInstance->FakeClient);
-		user->WriteNotice(INSP_FORMAT("Reputation of IP {} set to {}", ip, score));
+		BroadcastScore(key, INSP_FORMAT("*{}*", score), ServerInstance->FakeClient);
+		user->WriteNotice(INSP_FORMAT("Reputation of {} set to {}", key, score));
 	}
 
 	void ChannelQuery(User* user, Channel* channel)
@@ -679,7 +733,7 @@ public:
 				continue;
 			UpdateUser(user);
 
-			const std::string& ip = GetUserAddress(user);
+			const std::string ip = GetReputationKey(user);
 			if (ip.empty())
 				continue;
 
@@ -706,6 +760,14 @@ public:
 		const auto& tag = ServerInstance->Config->ConfValue("reputation");
 		if (dbpath.empty())
 			dbpath = ServerInstance->Config->Paths.PrependData(tag->getString("database", "reputation.db", 1));
+
+		ipv4prefix = static_cast<unsigned char>(tag->getNum<unsigned short>("ipv4prefix", 32, 0, 32));
+		ipv6prefix = static_cast<unsigned char>(tag->getNum<unsigned short>("ipv6prefix", 64, 0, 128));
+		if (ipv6prefix == 0)
+			ipv6prefix = 128;
+		if (ipv4prefix == 0)
+			ipv4prefix = 32;
+
 		bumpinterval = tag->getDuration("bumpinterval", DEFAULT_BUMP_INTERVAL, 1);
 		expireinterval = tag->getDuration("expireinterval", DEFAULT_EXPIRE_INTERVAL, 1);
 		saveinterval = tag->getDuration("saveinterval", DEFAULT_SAVE_INTERVAL, 1);
@@ -772,7 +834,7 @@ public:
 	{
 		UpdateUser(user);
 
-		const std::string& ip = GetUserAddress(user);
+		const std::string ip = GetReputationKey(user);
 		const auto score = static_cast<uint16_t>(std::max<intptr_t>(0, repouserext.Get(user)));
 		if (!ip.empty() && score)
 			BroadcastScore(ip, ConvToStr(score), ServerInstance->FakeClient);
