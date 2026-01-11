@@ -275,7 +275,16 @@ private:
 
 	std::string GetReputationKey(User* user) const
 	{
-		return NormaliseReputationKey(user->client_sa);
+		// Local users always have a real socket address.
+		if (user->client_sa.is_ip())
+			return NormaliseReputationKey(user->client_sa);
+
+		// Remote users may not have a usable sockaddrs representation; fall back to
+		// their textual address so ENCAP updates and extbans stay consistent.
+		const std::string& address = user->GetAddress();
+		if (address.empty())
+			return "";
+		return NormaliseReputationKey(address);
 	}
 
 	ReputationEntry* FindEntry(const std::string& ip)
