@@ -232,6 +232,25 @@ private:
 		if (!sa.is_ip())
 			return "";
 
+		// If the client connected via an IPv6 socket but is actually IPv4 then the
+		// address may be a v4-mapped IPv6 address (::ffff:0:0/96). Treat these as
+		// IPv4 so ipv4prefix applies and we don't accidentally group unrelated IPv4
+		// users by ipv6prefix.
+		if (sa.family() == AF_INET6)
+		{
+			const auto& a = sa.in6.sin6_addr.s6_addr;
+			static constexpr unsigned char V4MAP_PREFIX[12] = { 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF };
+			if (!memcmp(a, V4MAP_PREFIX, sizeof(V4MAP_PREFIX)))
+			{
+				irc::sockets::sockaddrs v4(false);
+				v4.in4.sin_family = AF_INET;
+				v4.in4.sin_port = 0;
+				memcpy(&v4.in4.sin_addr, a + 12, 4);
+				const unsigned char prefix = std::min<unsigned char>(ipv4prefix, 32);
+				return irc::sockets::cidr_mask(v4, prefix).str();
+			}
+		}
+
 		const unsigned char maxlen = sa.family() == AF_INET ? 32 : 128;
 		unsigned char prefix = sa.family() == AF_INET ? ipv4prefix : ipv6prefix;
 		if (prefix > maxlen)
