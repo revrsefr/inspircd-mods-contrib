@@ -1,24 +1,18 @@
 /*
  * InspIRCd -- Internet Relay Chat Daemon
  *
- *   Copyright (C) 2024 reverse
- *
- * This file contains a third-party module for InspIRCd. You can
+ * This file is part of InspIRCd.  InspIRCd is free software: you can
  * redistribute it and/or modify it under the terms of the GNU General Public
  * License as published by the Free Software Foundation, version 2.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
  * details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-/// $ModAuthor: reverse <mike.chevronnet@gmail.com>
-/// $ModDesc: IRCV3 draft/multiline.
-/// $ModDepends: core 4
 
 #include "inspircd.h"
 #include "clientprotocolmsg.h"
@@ -27,8 +21,8 @@
 
 namespace
 {
-	constexpr size_t DEFAULT_MAX_BYTES = 40000;
-	constexpr size_t DEFAULT_MAX_LINES = 50;
+	constexpr size_t DEFAULT_MAX_BYTES = 16000;
+	constexpr size_t DEFAULT_MAX_LINES = 10;
 
 	struct MultilineLine final
 	{
@@ -69,6 +63,8 @@ namespace
 		explicit MultilineCap(Module* mod)
 			: Cap::Capability(mod, "draft/multiline")
 		{
+			// The spec requires a value; initialise a sane default until config is read.
+			SetLimits(DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES);
 		}
 
 		const std::string* GetValue(LocalUser* user) const override
@@ -201,6 +197,7 @@ private:
 	MultilineTags tags;
 	Cap::Reference batchcap;
 	Cap::Reference messagetagcap;
+	IRCv3::Replies::CapReference stdrplcap;
 	IRCv3::Replies::Fail fail;
 	ClientProtocol::EventProvider batchevprov;
 	SimpleExtItem<UserBatches> userbatches;
@@ -208,9 +205,49 @@ private:
 	ChanModeReference moderatedmode;
 	ChanModeReference noextmsgmode;
 
+	struct ParsedTarget final
+	{
+		std::string raw;
+		std::string name;
+		char status = 0;
+		bool ischan = false;
+	};
+
+	static ParsedTarget ParseTarget(const std::string& raw)
+	{
+		ParsedTarget out;
+		out.raw = raw;
+
+		const char* target = raw.c_str();
+		PrefixMode* targetpfx = nullptr;
+		for (PrefixMode* pfx; (pfx = ServerInstance->Modes.FindPrefix(target[0])); ++target)
+		{
+			// We want the lowest ranked prefix specified.
+			if (!targetpfx || pfx->GetPrefixRank() < targetpfx->GetPrefixRank())
+				targetpfx = pfx;
+		}
+
+		out.status = targetpfx ? targetpfx->GetPrefix() : 0;
+		out.name.assign(target);
+		out.ischan = !out.name.empty() && ServerInstance->Channels.IsPrefix(out.name[0]);
+		return out;
+	}
+
 	static bool IsChannelTarget(const std::string& target)
 	{
-		return !target.empty() && ServerInstance->Channels.IsPrefix(target[0]);
+		return ParseTarget(target).ischan;
+	}
+
+	static ClientProtocol::TagMap CopyTagsWithoutMsgId(const ClientProtocol::TagMap& in)
+	{
+		ClientProtocol::TagMap out;
+		for (const auto& [name, data] : in)
+		{
+			if (name == "msgid")
+				continue;
+			out.emplace(name, data);
+		}
+		return out;
 	}
 
 	static bool IsValidBatchId(const std::string& id)
@@ -227,13 +264,13 @@ private:
 
 	void SendFail(LocalUser* user, const Command* command, const std::string& code, const std::string& text)
 	{
-		fail.SendIfCap(user, &cap, command, code, text);
+		fail.SendIfCap(user, stdrplcap, command, code, text);
 	}
 
 	template <typename... Args>
 	void SendFail(LocalUser* user, const Command* command, const std::string& code, Args&&... args)
 	{
-		fail.SendIfCap(user, &cap, command, code, std::forward<Args>(args)...);
+		fail.SendIfCap(user, stdrplcap, command, code, std::forward<Args>(args)...);
 	}
 
 	static size_t ComputeCombinedBytes(const std::vector<MultilineLine>& lines)
@@ -265,17 +302,47 @@ private:
 
 	void DeliverBatch(User* source, const MultilineBatch& batch)
 	{
+		const ParsedTarget parsed = ParseTarget(batch.target);
+		if (parsed.name.empty())
+			return;
+
 		// Target can be a channel or a user.
 		Channel* chan = nullptr;
 		User* usertarget = nullptr;
 
-		if (IsChannelTarget(batch.target))
-			chan = ServerInstance->Channels.Find(batch.target);
+		if (parsed.ischan)
+			chan = ServerInstance->Channels.Find(parsed.name);
 		else
-			usertarget = ServerInstance->Users.FindNick(batch.target, true);
+			usertarget = ServerInstance->Users.FindNick(parsed.name, true);
 
 		if (!chan && !usertarget)
 			return;
+
+		// Generate message tags once for the entire batch. These tags are attached to the opening
+		// BATCH line for multiline recipients, and to the first fallback message line.
+		ClientProtocol::TagMap batchtags;
+		std::string firstnonempty;
+		for (const auto& line : batch.lines)
+		{
+			if (!line.text.empty())
+			{
+				firstnonempty = line.text;
+				break;
+			}
+		}
+		if (!firstnonempty.empty())
+		{
+			ClientProtocol::TagMap emptytags;
+			const MessageType mt = (batch.cmd == MultilineCommand::NOTICE ? MessageType::NOTICE : MessageType::PRIVMSG);
+			MultilineMessageDetails details(mt, firstnonempty, emptytags);
+			MessageTarget msgtarget(chan ? MessageTarget(chan, parsed.status) : MessageTarget(usertarget));
+			ModResult modres;
+			FIRST_MOD_RESULT(OnUserPreMessage, modres, (source, msgtarget, details));
+			if (modres == MOD_RES_DENY)
+				return;
+			FOREACH_MOD(OnUserMessage, (source, msgtarget, details));
+			batchtags = details.tags_out;
+		}
 
 		std::vector<LocalUser*> multiline_users;
 		std::vector<LocalUser*> fallback_users;
@@ -290,7 +357,7 @@ private:
 			for (const auto& [u, memb] : chan->GetUsers())
 			{
 				LocalUser* lu = IS_LOCAL(u);
-				if (!lu || lu == source || !lu->IsFullyConnected())
+				if (!lu || !lu->IsFullyConnected())
 					continue;
 				if (IsMultilineRecipient(lu))
 					multiline_users.push_back(lu);
@@ -301,7 +368,7 @@ private:
 		else
 		{
 			LocalUser* lu = IS_LOCAL(usertarget);
-			if (lu && lu != source && lu->IsFullyConnected())
+			if (lu && lu->IsFullyConnected())
 			{
 				if (IsMultilineRecipient(lu))
 					multiline_users.push_back(lu);
@@ -313,6 +380,7 @@ private:
 		const bool isnotice = (batch.cmd == MultilineCommand::NOTICE);
 		const char* cmdstr = isnotice ? "NOTICE" : "PRIVMSG";
 		const MessageType msgtype = isnotice ? MessageType::NOTICE : MessageType::PRIVMSG;
+		ClientProtocol::EventProvider& rfcprov = ServerInstance->GetRFCEvents().privmsg;
 
 		// Send to multiline-capable users.
 		for (auto* lu : multiline_users)
@@ -323,6 +391,8 @@ private:
 			start.PushParam("+" + id);
 			start.PushParam("draft/multiline");
 			start.PushParam(batch.target);
+			if (!batchtags.empty())
+				start.AddTags(batchtags);
 			ClientProtocol::Event startevent(batchevprov, start);
 			lu->Send(startevent);
 
@@ -335,7 +405,7 @@ private:
 				if (batch.lines[i].concat)
 					msg.AddTag("draft/multiline-concat", &tags, "");
 
-				ClientProtocol::Event ev(ServerInstance->GetRFCEvents().privmsg, msg);
+				ClientProtocol::Event ev(rfcprov, msg);
 				lu->Send(ev);
 			}
 
@@ -354,12 +424,22 @@ private:
 			for (auto* lu : multiline_users)
 				exemptions.insert(lu);
 
+			bool firstsent = false;
 			for (const auto& line : batch.lines)
 			{
 				if (line.text.empty())
 					continue; // MUST NOT send blank lines in fallback.
 
+				ClientProtocol::TagMap outtags;
+				if (!firstsent)
+					outtags = batchtags;
+				else if (!batchtags.empty())
+					outtags = CopyTagsWithoutMsgId(batchtags);
+				firstsent = true;
+
 				ClientProtocol::Messages::Privmsg msg(ClientProtocol::Messages::Privmsg::nocopy, source, chan, line.text, msgtype);
+				if (!outtags.empty())
+					msg.AddTags(outtags);
 				msg.SetSideEffect(true);
 				chan->Write(ServerInstance->GetRFCEvents().privmsg, msg, 0, exemptions);
 			}
@@ -369,12 +449,22 @@ private:
 			// Local fallback delivery.
 			for (auto* lu : fallback_users)
 			{
+				bool firstsent = false;
 				for (const auto& line : batch.lines)
 				{
 					if (line.text.empty())
 						continue; // MUST NOT send blank lines in fallback.
 
+					ClientProtocol::TagMap outtags;
+					if (!firstsent)
+						outtags = batchtags;
+					else if (!batchtags.empty())
+						outtags = CopyTagsWithoutMsgId(batchtags);
+					firstsent = true;
+
 					ClientProtocol::Messages::Privmsg msg(ClientProtocol::Messages::Privmsg::nocopy, source, batch.target, line.text, msgtype);
+					if (!outtags.empty())
+						msg.AddTags(outtags);
 					ClientProtocol::Event ev(ServerInstance->GetRFCEvents().privmsg, msg);
 					lu->Send(ev);
 				}
@@ -417,7 +507,10 @@ private:
 
 		const std::string& batchid = batchit->second.value;
 		if (!IsValidBatchId(batchid))
-			return MOD_RES_PASSTHRU;
+		{
+			SendFail(user, &cmdbatch, "MULTILINE_INVALID", "Invalid multiline batch");
+			return MOD_RES_DENY;
+		}
 
 		UserBatches& batches = userbatches.GetRef(user);
 		auto openit = batches.open.find(batchid);
@@ -524,10 +617,11 @@ private:
 			if (!parent.cap.IsEnabled(lu))
 				return CmdResult::FAILURE;
 
-			// Per spec, multiline depends on batch and message-tags.
-			if (!parent.batchcap.IsEnabled(lu) || !parent.messagetagcap.IsEnabled(lu))
+			// Per spec, multiline depends on batch, message-tags, and standard-replies (for FAIL errors).
+			if (!parent.batchcap.IsEnabled(lu) || !parent.messagetagcap.IsEnabled(lu) || !parent.stdrplcap.IsEnabled(lu))
 			{
-				parent.SendFail(lu, this, "MULTILINE_INVALID", "Multiline requires the batch and message-tags capabilities");
+				lu->WriteNotice("*** Multiline requires CAP REQ :draft/multiline batch message-tags standard-replies");
+				parent.SendFail(lu, this, "MULTILINE_INVALID", "Multiline requires the batch, message-tags, and standard-replies capabilities");
 				return CmdResult::FAILURE;
 			}
 
@@ -573,6 +667,14 @@ private:
 				if (it == batches.open.end())
 				{
 					parent.SendFail(lu, this, "MULTILINE_INVALID", "Invalid multiline batch");
+					return CmdResult::FAILURE;
+				}
+
+				// Per spec, multiline batches MUST contain one or more PRIVMSG/NOTICE lines.
+				if (it->second.lines.empty())
+				{
+					parent.SendFail(lu, this, "MULTILINE_INVALID", "Invalid multiline batch");
+					batches.open.erase(it);
 					return CmdResult::FAILURE;
 				}
 
@@ -630,6 +732,7 @@ public:
 		, tags(this, cap)
 		, batchcap(this, "batch")
 		, messagetagcap(this, "message-tags")
+		, stdrplcap(this)
 		, fail(this)
 		, batchevprov(this, "BATCH")
 		, userbatches(this, "ircv3-multiline-batches", ExtensionType::USER)
