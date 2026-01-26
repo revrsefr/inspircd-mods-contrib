@@ -18,7 +18,7 @@
 
 /// $ModAuthor: Sadie Powell - Updated to v4 by reverse mike.chevronnet@gmail.com
 /// $ModAuthorMail: sadie@witchery.services
-/// $ModConfig: <solvemsg chanmsg="no" usermsg="yes" exemptregistered="yes" warntime="60s">
+/// $ModConfig: <solvemsg chanmsg="no" usermsg="yes" exemptregistered="yes" warntime="60s" warnintro="..." warnquestion="..." warnhowto="...">
 /// $ModDepends: core 4
 /// $ModDesc: Requires users to solve a basic maths problem before messaging others.
 
@@ -26,6 +26,20 @@
 #include "inspircd.h"
 #include "extension.h"
 #include "modules/account.h"
+
+static std::string ReplaceAll(std::string value, const std::string& needle, const std::string& replacement)
+{
+	if (needle.empty())
+		return value;
+
+	size_t pos = 0;
+	while ((pos = value.find(needle, pos)) != std::string::npos)
+	{
+		value.replace(pos, needle.size(), replacement);
+		pos += replacement.size();
+	}
+	return value;
+}
 
 struct Problem final
 {
@@ -81,6 +95,9 @@ class ModuleSolveMessage final
 	bool usermsg;
 	bool exemptregistered;
 	time_t warntime;
+	std::string warnintro;
+	std::string warnquestion;
+	std::string warnhowto;
 
  public:
 	ModuleSolveMessage()
@@ -98,6 +115,10 @@ class ModuleSolveMessage final
 		usermsg = tag->getBool("usermsg", true);
 		exemptregistered = tag->getBool("exemptregistered", true);
 		warntime = tag->getDuration("warntime", 60, 1);
+
+		warnintro = tag->getString("warnintro", "*** Before you can send messages you must solve the following problem:");
+		warnquestion = tag->getString("warnquestion", "*** What is {problem}?");
+		warnhowto = tag->getString("warnhowto", "*** You can enter your answer using /QUOTE SOLVE <answer>");
 	}
 
 	void OnUserPostInit(LocalUser* user) override
@@ -165,9 +186,9 @@ class ModuleSolveMessage final
 		if (problem->nextwarning > ServerInstance->Time())
 			return MOD_RES_DENY;
 
-		user->WriteNotice("*** Before you can send messages you must solve the following problem:");
-		user->WriteNotice(INSP_FORMAT("*** What is {} + {}?", problem->first, problem->second));
-		user->WriteNotice("*** You can enter your answer using /QUOTE SOLVE <answer>");
+		user->WriteNotice(warnintro);
+		user->WriteNotice(ReplaceAll(warnquestion, "{problem}", INSP_FORMAT("{} + {}", problem->first, problem->second)));
+		user->WriteNotice(warnhowto);
 		problem->nextwarning = ServerInstance->Time() + warntime;
 		return MOD_RES_DENY;
 	}
