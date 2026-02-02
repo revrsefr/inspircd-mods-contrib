@@ -27,12 +27,18 @@
 /// $LinkerFlags: -L/usr/local/lib -lhs
 
 #include "inspircd.h"
+#include "modules.h"
+#include "extension.h"
 #include "modules/exemption.h"
 #include "numerichelper.h"
 #include "utility/string.h"
+#include <filesystem>
 #include <hs/hs.h> // Hyperscan
 #include <unicode/regex.h>
 #include <unicode/unistr.h>
+#include <unicode/uchar.h>
+#include <unicode/uscript.h>
+#include <unicode/utf16.h>
 #include <codecvt>
 #include <locale>
 #include <fstream>
@@ -51,6 +57,7 @@ private:
 	std::string whitelist_regex_str;
 	hs_database_t* whitelist_db = nullptr;
 	hs_scratch_t* scratch = nullptr;
+	std::string whitelist_db_path;
 
 	static int onMatch(unsigned int id, unsigned long long from, unsigned long long to, unsigned int flags, void* ctx) {
 		bool* matched = (bool*)ctx;
@@ -114,6 +121,8 @@ private:
 	}
 
 	bool IsMatch(hs_database_t* db, const std::string& text) {
+		if (!db || !scratch)
+			return false;
 		bool matched = false;
 		if (hs_scan(db, text.c_str(), text.length(), 0, scratch, onMatch, &matched) != HS_SUCCESS) {
 			ServerInstance->Logs.Normal(MODNAME, "Hyperscan scan error");
@@ -126,29 +135,36 @@ private:
 		if (text.empty())
 			return false;
 
-		enum ScriptType { SCRIPT_UNKNOWN, SCRIPT_LATIN, SCRIPT_NONLATIN };
-		ScriptType detected = SCRIPT_UNKNOWN;
+		bool haslatin = false;
+		bool hasnonlatin = false;
 
-		for (const auto& c : text)
+		icu::UnicodeString ustr = icu::UnicodeString::fromUTF8(text);
+		for (int32_t i = 0; i < ustr.length(); )
 		{
-			if (static_cast<unsigned char>(c) < 128)
-				continue; // ASCII characters are ignored
+			const UChar32 cp = ustr.char32At(i);
+			i += U16_LENGTH(cp);
 
-			if (std::isalpha(static_cast<unsigned char>(c)))
-			{
-				ScriptType current = std::islower(static_cast<unsigned char>(c)) || std::isupper(static_cast<unsigned char>(c)) ? SCRIPT_LATIN : SCRIPT_NONLATIN;
-				if (detected == SCRIPT_UNKNOWN)
-				{
-					detected = current;
-				}
-				else if (detected != current)
-				{
-					return true; // Mixed scripts detected
-				}
-			}
+			if (cp < 0x80)
+				continue; // ASCII characters are ignored.
+
+			if (!u_isalpha(cp))
+				continue;
+
+			UErrorCode status = U_ZERO_ERROR;
+			const UScriptCode script = uscript_getScript(cp, &status);
+			if (U_FAILURE(status))
+				continue;
+
+			if (script == USCRIPT_LATIN)
+				haslatin = true;
+			else if (script != USCRIPT_COMMON && script != USCRIPT_INHERITED && script != USCRIPT_UNKNOWN)
+				hasnonlatin = true;
+
+			if (haslatin && hasnonlatin)
+				return true;
 		}
 
-		return false;
+		return haslatin && hasnonlatin;
 	}
 
 	bool IsEmojiOnly(const std::string& text)
@@ -207,14 +223,27 @@ public:
 	}
 
 	~ModuleCensor() override {
-		if (whitelist_db)
-			hs_free_database(whitelist_db);
+		ClearWhitelistDatabase();
+	}
+
+	void ClearWhitelistDatabase()
+	{
 		if (scratch)
+		{
 			hs_free_scratch(scratch);
+			scratch = nullptr;
+		}
+		if (whitelist_db)
+		{
+			hs_free_database(whitelist_db);
+			whitelist_db = nullptr;
+		}
 	}
 
 	void ReadConfig(ConfigStatus& status) override
 	{
+		ClearWhitelistDatabase();
+
 		CensorMap newcensors;
 		for (const auto& [_, badword_tag] : ServerInstance->Config->ConfTags("badword"))
 		{
@@ -246,9 +275,18 @@ public:
 			throw ModuleException(this, INSP_FORMAT("Failed to compile KiwiIRC regex pattern: {}", u_errorName(icu_status)));
 		}
 
-		const std::string db_path = "/home/debian/irc/ircd/inspircd/run/conf/hyperscan/whitelist.hsdb";
-		if (!DeserializeDatabase(db_path, &whitelist_db)) {
-			if (!CompileRegex(whitelist_regex_str, &whitelist_db) || !SerializeDatabase(whitelist_db, db_path)) {
+		const std::string db_name = tag->getString("whitelistdb", "hyperscan/whitelist.hsdb", 1);
+		whitelist_db_path = ServerInstance->Config->Paths.PrependData(db_name);
+
+		{
+			std::error_code ec;
+			const auto parent = std::filesystem::path(whitelist_db_path).parent_path();
+			if (!parent.empty())
+				std::filesystem::create_directories(parent, ec);
+		}
+
+		if (!DeserializeDatabase(whitelist_db_path, &whitelist_db)) {
+			if (!CompileRegex(whitelist_regex_str, &whitelist_db) || !SerializeDatabase(whitelist_db, whitelist_db_path)) {
 				throw ModuleException(this, "Failed to compile or serialize whitelist regex pattern for Hyperscan");
 			}
 		}
