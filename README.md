@@ -98,16 +98,40 @@ Use at your own risk; several are still work in progress.
 
 ### m_ssl_gnutls
 - Description: Provides TLS using GnuTLS with SNI-based profile selection.
-- Config: `<sslprofile name="gnutls-default" provider="gnutls" certfile="certs/default.pem" keyfile="certs/default.key">`
-- Config: `<sslprofile name="gnutls-example" provider="gnutls" certfile="certs/example.pem" keyfile="certs/example.key">`
-- Config: `<sni host="irc.example.net" sslprofile="gnutls-example">`
+- Config:
+```
+# SNI profiles
+# Extra profiles for each domain
+<sslprofile name="ClientsA"
+			provider="gnutls"
+			certfile="tls/sni/domain.net/fullchain.pem"
+			keyfile="tls/sni/domain.net/privkey.pem"
+			cafile="tls/sni/domain.net/chain.pem"
+			dhfile="dhparams.pem">
+
+# SNI mapping (wildcards supported)
+<sni host="irc.chaat.site" sslprofile="Clients">
+<sni host="irc.domain.net" sslprofile="ClientsA">
+```
 - Libs: -lgnutls
 
 ### m_ssl_openssl
 - Description: Provides TLS using OpenSSL with SNI-based profile selection.
-- Config: `<sslprofile name="openssl-default" provider="openssl" certfile="certs/default.pem" keyfile="certs/default.key">`
-- Config: `<sslprofile name="openssl-example" provider="openssl" certfile="certs/example.pem" keyfile="certs/example.key">`
-- Config: `<sni host="irc.example.net" sslprofile="openssl-example">`
+- Config:
+```
+# SNI profiles
+# Extra profiles for each domain
+<sslprofile name="ClientsA"
+			provider="openssl"
+			certfile="tls/sni/puntochat.net/fullchain.pem"
+			keyfile="tls/sni/puntochat.net/privkey.pem"
+			cafile="tls/sni/puntochat.net/chain.pem"
+			dhfile="dhparams.pem">
+
+# SNI mapping (wildcards supported)
+<sni host="irc.chaat.site" sslprofile="Clients">
+<sni host="irc.puntochat.net" sslprofile="ClientsA">
+```
 - Libs: -lssl -lcrypto
 
 ### m_profileLink
