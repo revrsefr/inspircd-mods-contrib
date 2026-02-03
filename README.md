@@ -96,6 +96,20 @@ Use at your own risk; several are still work in progress.
 - Config: None
 - Libs: None
 
+### m_ssl_gnutls
+- Description: Provides TLS using GnuTLS with SNI-based profile selection.
+- Config: <sslprofile name="gnutls-default" provider="gnutls" certfile="certs/default.pem" keyfile="certs/default.key">
+- Config: <sslprofile name="gnutls-example" provider="gnutls" certfile="certs/example.pem" keyfile="certs/example.key">
+- Config: <sni host="irc.example.net" sslprofile="gnutls-example">
+- Libs: -lgnutls
+
+### m_ssl_openssl
+- Description: Provides TLS using OpenSSL with SNI-based profile selection.
+- Config: <sslprofile name="openssl-default" provider="openssl" certfile="certs/default.pem" keyfile="certs/default.key">
+- Config: <sslprofile name="openssl-example" provider="openssl" certfile="certs/example.pem" keyfile="certs/example.key">
+- Config: <sni host="irc.example.net" sslprofile="openssl-example">
+- Libs: -lssl -lcrypto
+
 ### m_profileLink
 - Description: Adds a profile link to the WHOIS response for registered users, ignoring services, bots.
 - Config: <profilelink baseurl="https://example.com/profil/">
