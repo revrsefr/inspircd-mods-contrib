@@ -86,6 +86,11 @@ Use at your own risk; several are still work in progress.
 - Config: None
 - Libs: None
 
+### m_ircv3_network_icon
+- Description: Provides the IRCv3 draft/network-icon ISUPPORT token (draft/ICON).
+- Config: `<networkicon url="https://example.org/icon.svg">`
+- Libs: None
+
 ### m_ircv3_noimplicitnames
 - Description: IRCV3 draft/no-implicit-names.
 - Config: None
